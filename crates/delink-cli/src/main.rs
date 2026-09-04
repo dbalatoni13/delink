@@ -208,7 +208,7 @@ enum Cmd {
         /// Output directory for the objects.
         #[arg(short, long)]
         outdir: PathBuf,
-        /// Path to an existing `idapro.json` controlling function → file grouping.
+        /// Path to an existing `idapro.json` controlling function-address → file grouping.
         #[arg(long)]
         idapro: Option<PathBuf>,
         /// Emit ELF `.o` objects instead of COFF `.obj` (default is chosen from

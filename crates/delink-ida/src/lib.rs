@@ -13,7 +13,8 @@
 //!
 //! Like the Mach-O `symtab.json` flow, the split is driven by an editable
 //! `idapro.json` mapping each output object filename to a list of function
-//! names; see [`idapro_json`].
+//! start addresses. Names, bounds, and visibility always come from the exported
+//! model; see [`idapro_json`].
 
 pub mod emit;
 pub mod idapro_json;

@@ -6,7 +6,7 @@
 //! [`delink_x86_64`]) for rel32 calls/jumps and RIP-relative references, and
 //! uses IDA's fixup table for absolute pointers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -17,11 +17,9 @@ use object::{
 };
 use rayon::prelude::*;
 
-use std::collections::BTreeMap;
-
-use crate::idapro_json::{IdaproJson, SymbolDef};
+use crate::idapro_json::IdaproJson;
 use crate::resolver::{IdaSymbols, SYM_BSS_START, SYM_CONST_START, SYM_DATA_START};
-use crate::{IdaArch, IdaModel, PeImage, SegClass};
+use crate::{Function, IdaArch, IdaModel, PeImage, SegClass};
 
 /// Read `len` bytes at `rva` from the original binary, zero-padding any tail not
 /// backed by raw section data (e.g. virtual-size padding).
@@ -104,8 +102,9 @@ pub struct CuOutcome {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Split driven by an `idapro.json` grouping.  Symbols sharing a key are
-/// emitted into one object named exactly by that key.
+/// Split driven by an `idapro.json` grouping. Function addresses sharing a key
+/// are emitted into one object named exactly by that key; all function metadata
+/// is resolved from `model`.
 pub fn split_by_groups(
     model: &IdaModel,
     pe: &PeImage,
@@ -122,13 +121,27 @@ pub fn split_by_groups(
     }
     std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
-    let group_vec: Vec<(&String, &BTreeMap<String, SymbolDef>)> = groups.iter().collect();
+    // Build the model lookup once. The default grouping has one object per
+    // function, so rebuilding this map inside every object emission would be
+    // quadratic in the number of functions.
+    let functions_by_start: HashMap<u64, &Function> =
+        model.functions.iter().map(|f| (f.start, f)).collect();
+
+    let group_vec: Vec<(&String, &Vec<u64>)> = groups.iter().collect();
     let outcomes = group_vec
         .par_iter()
-        .map(|(file_name, syms)| {
+        .map(|(file_name, addresses)| {
             let file = out_dir.join(file_name.as_str());
-            let result =
-                emit_object(model, pe, symbols, syms, format, &file).map_err(|e| format!("{e:#}"));
+            let result = emit_object(
+                model,
+                pe,
+                symbols,
+                &functions_by_start,
+                addresses,
+                format,
+                &file,
+            )
+            .map_err(|e| format!("{e:#}"));
             CuOutcome {
                 cu_name: (*file_name).clone(),
                 file,
@@ -306,19 +319,33 @@ fn emit_object(
     model: &IdaModel,
     pe: &PeImage,
     symbols: &IdaSymbols,
-    syms: &BTreeMap<String, SymbolDef>,
+    functions_by_start: &HashMap<u64, &Function>,
+    addresses: &[u64],
     format: OutputFormat,
     out_path: &Path,
 ) -> Result<EmitStats> {
-    // Order the group's symbols by address; each carries its own va/size/scope.
-    let mut funcs: Vec<(&String, u64, u64, bool)> = syms
-        .iter()
-        .filter(|(_, d)| d.size > 0)
-        .map(|(n, d)| (n, d.address, d.address + d.size, d.scope.is_global()))
-        .collect();
-    funcs.sort_by_key(|(_, start, _, _)| *start);
+    // `idapro.json` contains grouping only. Resolve every configured address
+    // through the authoritative delink model for name, bounds, and visibility.
+    let mut seen = HashSet::new();
+    let mut funcs = Vec::with_capacity(addresses.len());
+    for &address in addresses {
+        if !seen.insert(address) {
+            return Err(anyhow!("duplicate function address {address:#x} in group"));
+        }
+        let f = functions_by_start.get(&address).ok_or_else(|| {
+            anyhow!("idapro address {address:#x} is not a function start in delink.json")
+        })?;
+        if f.size() == 0 {
+            return Err(anyhow!(
+                "function '{}' at {address:#x} has zero size in delink.json",
+                f.name
+            ));
+        }
+        funcs.push(*f);
+    }
+    funcs.sort_by_key(|f| f.start);
     if funcs.is_empty() {
-        return Err(anyhow!("group has no resolvable functions"));
+        return Err(anyhow!("group has no functions"));
     }
 
     let (arch, endian) = obj_arch(model);
@@ -345,8 +372,11 @@ fn emit_object(
     let mut pending: Vec<Pending> = Vec::new();
     let rel32 = rel32_flags(format, model.arch);
 
-    for (name, start, end, public) in &funcs {
-        let size = end - start;
+    for f in &funcs {
+        let name = &f.name;
+        let start = f.start;
+        let end = f.end;
+        let size = f.size();
         let rva = start.wrapping_sub(model.image_base);
         let Some(orig) = pe.data_at_rva(rva, size as usize) else {
             tracing::warn!(
@@ -358,7 +388,7 @@ fn emit_object(
         stats.text_bytes += size;
 
         // 1) iced-x86 recovery → rel32 relocations.
-        let recovered = recover(model, &bytes, *start, size, symbols)?;
+        let recovered = recover(model, &bytes, start, size, symbols)?;
         stats.instructions += recovered.instructions;
         stats.unresolved_calls += recovered.unresolved_calls;
         stats.unresolved_rip += recovered.unresolved_rip;
@@ -371,7 +401,7 @@ fn emit_object(
 
         // 2) IDA fixup table → absolute relocations within this function.
         let mut abs: Vec<(u64, String, i64, RelocationFlags)> = Vec::new();
-        for r in symbols.relocs_in(*start..*end) {
+        for r in symbols.relocs_in(start..end) {
             let Some(flags) = abs_flags(format, model.arch, r.size) else {
                 continue;
             };
@@ -388,7 +418,7 @@ fn emit_object(
 
         let fn_off = obj.append_section_data(sid, &bytes, 1);
 
-        let scope = if *public {
+        let scope = if f.public {
             SymbolScope::Dynamic
         } else {
             SymbolScope::Compilation
@@ -403,7 +433,7 @@ fn emit_object(
             section: SymbolSection::Section(sid),
             flags: SymbolFlags::None,
         });
-        local.insert((*name).clone(), sym_id);
+        local.insert(name.clone(), sym_id);
 
         for (off, tname, addend, flags) in abs {
             pending.push(Pending {

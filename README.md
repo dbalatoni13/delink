@@ -47,9 +47,11 @@ has to link against IDA:
    `--elf` for ELF `.o`).
 
    As with the Mach-O splitter, the first run writes an editable `idapro.json`
-   grouping (`{ "<obj>": { "<sym>": {address, size, scope} } }`) into the output
-   directory. Edit it to group symbols into objects (and rename keys to rename
-   files), then re-run with `--idapro ./out/idapro.json`.
+   grouping (`{ "<obj>": [<function-address>, ...] }`) into the output
+   directory. Edit only the address lists to group functions into objects (and
+   rename object keys to rename files), then re-run with
+   `--idapro ./out/idapro.json`. Function names, sizes, and visibility always
+   come from `delink.ida.json`.
 
 ## Building
 

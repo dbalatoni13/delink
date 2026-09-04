@@ -439,22 +439,19 @@ def _default_object_name():
 
 
 def build_config(obj_name):
-    """Collapsed grouping/config: every function → one object `obj_name`, each
-    symbol carrying its address, size, and scope (global/static)."""
-    syms = {}
+    """Collapsed grouping config: every function start address → `obj_name`.
+
+    Names, function bounds/sizes, and visibility live only in the full model JSON.
+    """
+    addrs = []
     for ea in idautils.Functions():
         func = ida_funcs.get_func(ea)
         if func is None or func.end_ea <= func.start_ea:
             continue
         if func.flags & ida_funcs.FUNC_TAIL:
             continue
-        name = ida_funcs.get_func_name(ea) or ("sub_%X" % ea)
-        syms[name] = {
-            "address": int(func.start_ea),
-            "size": int(func.end_ea - func.start_ea),
-            "scope": "global" if ida_name.is_public_name(ea) else "static",
-        }
-    return {obj_name: syms}
+        addrs.append(int(func.start_ea))
+    return {obj_name: addrs}
 
 
 def main():
@@ -498,8 +495,8 @@ def main():
         cfg = build_config(obj_name or _default_object_name())
         with open(config_out, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
-        nsym = sum(len(v) for v in cfg.values())
-        wrote.append("config %d symbols -> %s" % (nsym, config_out))
+        nfunc = sum(len(v) for v in cfg.values())
+        wrote.append("config %d functions -> %s" % (nfunc, config_out))
 
     if wrote:
         for line in wrote:
