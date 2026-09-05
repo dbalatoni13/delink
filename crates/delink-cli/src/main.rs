@@ -198,7 +198,7 @@ enum Cmd {
     /// recover rel32 / RIP-relative relocations; IDA's fixup table supplies the
     /// absolute pointer relocations.  On the first run a default `idapro.json`
     /// (one function per file) is written to the output directory; edit it to
-    /// group functions and re-run with `--idapro`.
+    /// group functions (or use function ranges) and re-run with `--idapro`.
     IdaSplit {
         /// Path to the JSON produced by `ida_export.py`.
         json: PathBuf,
@@ -208,7 +208,8 @@ enum Cmd {
         /// Output directory for the objects.
         #[arg(short, long)]
         outdir: PathBuf,
-        /// Path to an existing `idapro.json` controlling function-address → file grouping.
+        /// Existing `idapro.json` controlling explicit/whole-range function
+        /// and `.rdata`/`.data`/logical `.bss` range → file grouping.
         #[arg(long)]
         idapro: Option<PathBuf>,
         /// Emit ELF `.o` objects instead of COFF `.obj` (default is chosen from
@@ -1380,7 +1381,8 @@ fn cmd_ida_split(
     };
     let shared = outdir.join(format!("__shared_data.{shared_ext}"));
     tracing::info!("emitting shared data → {}", shared.display());
-    let shared_stats = delink_ida::emit::emit_shared(&model, &pe, &symbols, &shared, format)?;
+    let shared_stats =
+        delink_ida::emit::emit_shared_for_groups(&model, &pe, &symbols, &groups, &shared, format)?;
 
     // Summary.
     let mut total = delink_ida::emit::EmitStats::default();
@@ -1389,6 +1391,9 @@ fn cmd_ida_split(
         match &o.result {
             Ok(s) => {
                 total.text_bytes += s.text_bytes;
+                total.data_bytes += s.data_bytes;
+                total.const_bytes += s.const_bytes;
+                total.bss_bytes += s.bss_bytes;
                 total.instructions += s.instructions;
                 total.local_symbols += s.local_symbols;
                 total.undef_symbols += s.undef_symbols;
@@ -1404,10 +1409,13 @@ fn cmd_ida_split(
     }
 
     println!(
-        "ida-split complete: {} objects ({} failed)\n  {} bytes .text, {} instructions\n  {} local + {} undef symbols\n  {} relocs ({} unresolved calls, {} unresolved rip refs)\n  shared: data={} const={} bss={} ({} relocs)",
+        "ida-split complete: {} objects ({} failed)\n  {} bytes .text, {} bytes .rdata, {} bytes .data, {} bytes .bss, {} instructions\n  {} local + {} undef symbols\n  {} relocs ({} unresolved calls, {} unresolved rip refs)\n  shared: data={} const={} bss={} ({} relocs)",
         outcomes.len().saturating_sub(failures),
         failures,
         total.text_bytes,
+        total.const_bytes,
+        total.data_bytes,
+        total.bss_bytes,
         total.instructions,
         total.local_symbols,
         total.undef_symbols,

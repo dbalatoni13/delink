@@ -130,6 +130,14 @@ impl IdaSymbols {
         None
     }
 
+    /// Resolve only an exact exported name, without falling back to a section
+    /// anchor or an enclosing function. Used by split emission so a named
+    /// data target remains renameable even when its containing range belongs
+    /// to a different object.
+    pub fn resolve_exact(&self, va: u64) -> Option<(String, i64)> {
+        self.names.get(&va).cloned().map(|name| (name, 0))
+    }
+
     /// Resolve a data reference → `(symbol, addend)`.
     pub fn resolve_data(&self, va: u64) -> Option<(String, i64)> {
         if let Some(name) = self.names.get(&va) {

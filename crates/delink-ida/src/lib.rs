@@ -12,8 +12,10 @@
 //! pointers (in code or data) come from IDA's fixup table.
 //!
 //! Like the Mach-O `symtab.json` flow, the split is driven by an editable
-//! `idapro.json` mapping each output object filename to a list of function
-//! start addresses. Names, bounds, and visibility always come from the exported
+//! `idapro.json` mapping each output object filename to explicit function start
+//! addresses, optional whole-function ranges, and optional `.rdata` / `.data`
+//! / logical `.bss`
+//! address ranges. Names, bounds, and visibility always come from the exported
 //! model; see [`idapro_json`].
 
 pub mod emit;

@@ -6,7 +6,9 @@ Run this inside IDA (9.x) to export the *information* delink needs to split the
 analysed binary into relocatable objects -- but **not** the bytes.  The export
 is small and human-readable (pretty-printed JSON) and contains: the
 architecture/segment layout, every function (boundaries + flags), every named
-address, and the relocations IDA knows about.
+address, and the relocations IDA knows about. Data targets that IDA renders
+with an auto-name but does not store in its named-address table are exported
+with deterministic scalar names as well.
 
 The bytes come from the original input binary, passed to delink on the command
 line:
@@ -15,8 +17,10 @@ line:
 
 Relocations are gathered from two IDA sources, deduplicated:
   * the fixup table (`ida_fixup`), and
-  * offset-typed operands (`is_off`) -- the only relocation record for images
-    with no relocation table, e.g. the Freelancer EXEs.
+  * address-bearing code/data operands, including offset-typed operands and
+    32-bit absolute memory references backed by IDA data xrefs -- the only
+    relocation record for images with no relocation table, e.g. fixed-base
+    EXEs.
 delink additionally reads the PE `.reloc` table from the binary (present in the
 DLLs) and recovers rel32 calls/jumps with iced-x86, resolving every target
 address through the exported name map.
@@ -234,21 +238,70 @@ def export_functions():
 # ---------------------------------------------------------------------------
 # names (the full address -> symbol map used to resolve relocation targets)
 # ---------------------------------------------------------------------------
-def export_names():
+def _default_data_name(address, size):
+    """Match IDA's conventional name for an unnamed scalar at `address`."""
+    prefix = {1: "byte", 2: "word", 4: "dword", 8: "qword"}.get(size, "data")
+    return "%s_%X" % (prefix, address)
+
+
+def export_names(relocations=None):
+    """Export IDA names and synthesize names for unnamed data relocations.
+
+    Hex-Rays can render an auto-name such as ``dword_893D58`` for a data
+    reference even when the address is not present in IDA's named-address
+    table. Keep those relocation targets editable in the exported JSON by
+    adding a deterministic scalar name when no real IDA name exists.
+    """
     out = []
+    known = set()
     for ea, name in idautils.Names():
         if not name:
             continue
+        ea = int(ea)
+        known.add(ea)
         func = ida_funcs.get_func(ea)
         out.append(
             {
-                "addr": int(ea),
+                "addr": ea,
                 "name": name,
                 "public": bool(ida_name.is_public_name(ea)),
                 "weak": bool(ida_name.is_weak_name(ea)),
                 "is_func": bool(func is not None and func.start_ea == ea),
             }
         )
+
+    # IDA's decompiler may display an auto-generated dword_/qword_ label for a
+    # data item that has no entry in idautils.Names(). Relocations still carry
+    # the exact target, so use them to make such targets first-class symbols.
+    targets = {}
+    for relocation in relocations or ():
+        target = int(relocation.get("target") or 0)
+        if target in known or target == 0 or target == BADADDR:
+            continue
+        seg = ida_segment.getseg(target)
+        if seg is None or _seg_class(seg) not in ("CONST", "DATA", "BSS"):
+            continue
+        size = int(relocation.get("size") or 0)
+        targets[target] = max(size, targets.get(target, 0))
+
+    for target, size in sorted(targets.items()):
+        # Prefer a name that IDA can resolve directly, even if the iterator
+        # omitted it for this kind of unnamed data item.
+        try:
+            name = ida_name.get_name(target) or ""
+        except Exception:
+            name = ""
+        out.append(
+            {
+                "addr": target,
+                "name": name or _default_data_name(target, size),
+                "public": False,
+                "weak": False,
+                "is_func": False,
+            }
+        )
+
+    out.sort(key=lambda item: item["addr"])
     return out
 
 
@@ -326,13 +379,17 @@ def _dtype_size(dtype, default):
 
 
 def export_offset_relocations(ptr_size):
-    """Absolute relocations derived from IDA's offset-typed operands.
+    """Absolute relocations derived from IDA's address-bearing operands.
 
-    This is how IDA records address references when the image carries no
-    relocation table — notably the EXEs, whose databases mark every absolute
-    operand as an offset so the binary can be rebuilt.  For each such operand we
-    record the exact field address (`insn ea + op.offb` for code, the item ea
-    for data), its width, and the stored target VA.
+    IDA does not mark every absolute memory operand with `is_off()`. In
+    particular, indexed PE32 operands such as `global[index*4]` can have a data
+    xref and a rendered name while remaining an ordinary o_displ/o_mem operand.
+    Recover those from the decoded operand plus IDA's outgoing data xrefs.
+
+    For each address-bearing operand, record the exact encoded field address
+    (`insn ea + op.offb` for code, the item ea for data), its width, and target
+    VA. The 32-bit memory-xref path is deliberately limited to PE32-style
+    absolute displacements; x86-64 RIP-relative fields are not absolute.
     """
     out = []
     for seg_ea in idautils.Segments():
@@ -343,48 +400,69 @@ def export_offset_relocations(ptr_size):
         end = seg.end_ea
         while ea < end and ea != BADADDR:
             f = ida_bytes.get_full_flags(ea)
-            o0 = ida_bytes.is_off(f, 0)
-            o1 = ida_bytes.is_off(f, 1)
-            if o0 or o1:
-                if ida_bytes.is_code(f):
-                    insn = ida_ua.insn_t()
-                    if ida_ua.decode_insn(insn, ea) > 0:
-                        for n in (0, 1):
-                            if (n == 0 and not o0) or (n == 1 and not o1):
-                                continue
-                            op = insn.ops[n]
-                            if op.type == ida_ua.o_void or op.offb == 0:
-                                continue  # no locatable field
-                            field = ea + op.offb
+            offsets = (ida_bytes.is_off(f, 0), ida_bytes.is_off(f, 1))
+            if ida_bytes.is_code(f):
+                insn = ida_ua.insn_t()
+                if ida_ua.decode_insn(insn, ea) > 0:
+                    data_refs = {int(ref) for ref in idautils.DataRefsFrom(ea)}
+                    for n in (0, 1):
+                        op = insn.ops[n]
+                        if op.type == ida_ua.o_void or op.offb == 0:
+                            continue  # no locatable encoded field
+
+                        is_offset = offsets[n]
+                        is_abs_memory = (
+                            ptr_size == 4
+                            and op.type in (ida_ua.o_mem, ida_ua.o_displ)
+                            and bool(data_refs)
+                        )
+                        if not is_offset and not is_abs_memory:
+                            continue
+
+                        field = ea + op.offb
+                        if is_abs_memory and not is_offset:
+                            # op.addr is normally the base VA. Use the xref as a
+                            # fallback for processor-module variants that store
+                            # only the displacement in the operand structure.
+                            operand_target = int(op.addr)
+                            if operand_target in data_refs:
+                                target = operand_target
+                            elif len(data_refs) == 1:
+                                target = next(iter(data_refs))
+                            else:
+                                continue  # ambiguous: do not guess a target
+                            size = 4
+                        else:
                             size = _dtype_size(op.dtype, ptr_size)
                             if size == 8:
                                 target = int(ida_bytes.get_qword(field))
                             else:
                                 size = 4
                                 target = int(ida_bytes.get_dword(field))
-                            out.append(
-                                {
-                                    "addr": int(field),
-                                    "type": "OFF%d" % (size * 8),
-                                    "size": size,
-                                    "target": target,
-                                }
-                            )
-                elif o0:  # data offset item — the field is the item itself
-                    size = ptr_size
-                    if size == 8:
-                        target = int(ida_bytes.get_qword(ea))
-                    else:
-                        size = 4
-                        target = int(ida_bytes.get_dword(ea))
-                    out.append(
-                        {
-                            "addr": int(ea),
-                            "type": "OFF%d" % (size * 8),
-                            "size": size,
-                            "target": target,
-                        }
-                    )
+
+                        out.append(
+                            {
+                                "addr": int(field),
+                                "type": "OFF%d" % (size * 8),
+                                "size": size,
+                                "target": target,
+                            }
+                        )
+            elif offsets[0]:  # data offset item — the field is the item itself
+                size = ptr_size
+                if size == 8:
+                    target = int(ida_bytes.get_qword(ea))
+                else:
+                    size = 4
+                    target = int(ida_bytes.get_dword(ea))
+                out.append(
+                    {
+                        "addr": int(ea),
+                        "type": "OFF%d" % (size * 8),
+                        "size": size,
+                        "target": target,
+                    }
+                )
             nh = ida_bytes.next_head(ea, end)
             if nh <= ea:
                 break
@@ -393,7 +471,7 @@ def export_offset_relocations(ptr_size):
 
 
 def build_relocations(ptr_size):
-    """Combine IDA's fixup table and its offset-typed operands (dedup by addr)."""
+    """Combine IDA fixups and inferred address operands (dedup by address)."""
     by_addr = {}
     for r in export_relocations():
         by_addr[r["addr"]] = r
@@ -408,6 +486,7 @@ def build_relocations(ptr_size):
 def build_model():
     procname = _procname()
     bits = _app_bits()
+    relocations = build_relocations(8 if bits == 64 else 4)
     return {
         "delink_ida_version": SCHEMA_VERSION,
         "meta": {
@@ -423,8 +502,8 @@ def build_model():
         },
         "segments": export_segments(),
         "functions": export_functions(),
-        "names": export_names(),
-        "relocations": build_relocations(8 if bits == 64 else 4),
+        "names": export_names(relocations),
+        "relocations": relocations,
     }
 
 
@@ -441,7 +520,11 @@ def _default_object_name():
 def build_config(obj_name):
     """Collapsed grouping config: every function start address → `obj_name`.
 
-    Names, function bounds/sizes, and visibility live only in the full model JSON.
+    The empty range lists make the editable whole-function, `.rdata`, `.data`,
+    and logical `.bss` range syntax visible in the generated config. Ranges are
+    half-open `[start, end)` pairs; function ranges must contain complete
+    functions. A `.bss` range may select a BSS segment or a zero-initialized
+    tail that IDA reports inside DATA.
     """
     addrs = []
     for ea in idautils.Functions():
@@ -451,7 +534,15 @@ def build_config(obj_name):
         if func.flags & ida_funcs.FUNC_TAIL:
             continue
         addrs.append(int(func.start_ea))
-    return {obj_name: addrs}
+    return {
+        obj_name: {
+            "functions": addrs,
+            "function_ranges": [],
+            "rdata": [],
+            "data": [],
+            "bss": [],
+        }
+    }
 
 
 def main():
@@ -495,7 +586,7 @@ def main():
         cfg = build_config(obj_name or _default_object_name())
         with open(config_out, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)
-        nfunc = sum(len(v) for v in cfg.values())
+        nfunc = sum(len(v["functions"]) for v in cfg.values())
         wrote.append("config %d functions -> %s" % (nfunc, config_out))
 
     if wrote:

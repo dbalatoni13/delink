@@ -25,7 +25,9 @@ has to link against IDA:
    layout, every function (boundaries + flags), the full address → name map, and
    the relocations IDA knows (its fixup table **and** offset-typed operands —
    the latter being the only relocation record for images with no `.reloc`,
-   e.g. EXEs). The export carries **no bytes**:
+   e.g. EXEs). Unnamed data targets referenced by those relocations receive
+   deterministic `byte_`/`word_`/`dword_`/`qword_` names so they can be edited
+   in the exported JSON. The export carries **no bytes**:
 
    ```shell
    # headless (idat64.exe for a 64-bit database)
@@ -47,11 +49,30 @@ has to link against IDA:
    `--elf` for ELF `.o`).
 
    As with the Mach-O splitter, the first run writes an editable `idapro.json`
-   grouping (`{ "<obj>": [<function-address>, ...] }`) into the output
-   directory. Edit only the address lists to group functions into objects (and
-   rename object keys to rename files), then re-run with
-   `--idapro ./out/idapro.json`. Function names, sizes, and visibility always
-   come from `delink.ida.json`.
+   grouping into the output directory. Each object can contain explicit
+   functions, whole-function ranges, and half-open IDA virtual-address ranges
+   from `.rdata`, `.data`, and logical `.bss`:
+
+   ```json
+   {
+     "example.obj": {
+       "functions": [268441600, 268441648],
+       "function_ranges": [[268442000, 268443000]],
+       "rdata": [[268500992, 268501120]],
+       "data": [[268566528, 268566592]],
+       "bss": [[268570624, 268571648]]
+     }
+   }
+   ```
+
+   `function_ranges` uses half-open `[start, end)` virtual-address ranges and
+   selects every complete function whose bounds fit inside the range. A range
+   that cuts through a function is rejected. Assigned `.rdata`/`.data` ranges
+   are emitted in that object and removed from `__shared_data.obj`. A `bss`
+   range is emitted as zero-filled `.bss`; it can refer to an IDA BSS segment
+   or to a BSS tail that IDA reports inside `.data`. The old
+   `{ "<obj>": [<function-address>, ...] }` form is still accepted. Function
+   and data-symbol metadata always comes from `delink.ida.json`.
 
 ## Building
 
