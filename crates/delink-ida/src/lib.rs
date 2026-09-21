@@ -154,6 +154,8 @@ pub struct JumpTable {
     pub owner: u64,
     pub dispatch: u64,
     pub dispatch_addr: Option<u64>,
+    /// Additional encoded fields when more than one dispatch uses this table.
+    pub dispatch_addrs: Vec<u64>,
     pub start: u64,
     pub entry_size: u32,
     pub entries: Vec<JumpTableEntry>,
@@ -163,6 +165,12 @@ pub struct JumpTable {
 impl JumpTable {
     pub fn end(&self) -> u64 {
         self.start + self.entry_size as u64 * self.entries.len() as u64
+    }
+
+    pub fn dispatch_fields(&self) -> impl Iterator<Item = u64> + '_ {
+        self.dispatch_addr
+            .into_iter()
+            .chain(self.dispatch_addrs.iter().copied())
     }
 }
 
@@ -347,6 +355,7 @@ pub fn load(path: &Path) -> Result<IdaModel> {
             owner: table.owner,
             dispatch: table.dispatch,
             dispatch_addr: table.dispatch_addr,
+            dispatch_addrs: Vec::new(),
             start: table.start,
             entry_size: table.entry_size,
             entries: table

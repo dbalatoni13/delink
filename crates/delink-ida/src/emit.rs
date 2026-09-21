@@ -449,7 +449,7 @@ fn emit_object(
             if let Some(orig) =
                 pe.data_at_rva(start.wrapping_sub(model.image_base), base_size as usize)
             {
-                tables = discover_x86_jump_tables(orig, start, end);
+                tables = discover_x86_jump_tables(orig, start, end, model, pe);
             }
         }
         tables.sort_by_key(|table| table.start);
@@ -458,8 +458,8 @@ fn emit_object(
                 || table.entry_size == 0
                 || owner_section.is_some_and(|section| table.end() > section.end)
                 || table
-                    .dispatch_addr
-                    .is_some_and(|field| field < start || field.saturating_add(4) > end)
+                    .dispatch_fields()
+                    .any(|field| field < start || field.saturating_add(4) > end)
                 || table.entries.iter().enumerate().any(|(i, entry)| {
                     entry.addr != table.start + i as u64 * table.entry_size as u64
                 })
@@ -544,7 +544,7 @@ fn emit_object(
                     .entries
                     .iter()
                     .map(|entry| entry.addr)
-                    .chain(table.dispatch_addr)
+                    .chain(table.dispatch_fields())
             })
             .collect();
         for r in symbols.relocs_in(start..emit_end) {
@@ -566,7 +566,7 @@ fn emit_object(
         }
 
         for table in &tables {
-            if let Some(field) = table.dispatch_addr {
+            for field in table.dispatch_fields() {
                 let off = (field - start) as usize;
                 if off + 4 <= bytes.len() {
                     bytes[off..off + 4].fill(0);
@@ -629,7 +629,7 @@ fn emit_object(
             });
             local.insert(table.name.clone(), table_id);
 
-            if let Some(field) = table.dispatch_addr {
+            for field in table.dispatch_fields() {
                 let off = (field - start) as usize;
                 if off + 4 <= bytes.len() {
                     if let Some(flags) = abs_flags(format, model.arch, 4) {
@@ -885,11 +885,30 @@ struct SplitResolver<'a> {
 /// Backward compatibility for schema-v1 exports: recognize the conventional
 /// x86 `jmp [index*4 + table]` form and scan its absolute case pointers. New
 /// exports use IDA's authoritative switch metadata instead.
-fn discover_x86_jump_tables(bytes: &[u8], start: u64, end: u64) -> Vec<JumpTable> {
+fn discover_x86_jump_tables(
+    bytes: &[u8],
+    start: u64,
+    end: u64,
+    model: &IdaModel,
+    pe: &PeImage,
+) -> Vec<JumpTable> {
     let mut decoder = Decoder::with_ip(32, bytes, start, DecoderOptions::NONE);
-    let mut tables = Vec::new();
+    let section_end = model.section_for(start).map_or(end, |section| section.end);
+    let next_function = model
+        .functions
+        .iter()
+        .filter(|function| function.start > start)
+        .map(|function| function.start)
+        .min()
+        .unwrap_or(section_end)
+        .min(section_end);
+    let mut dispatches = Vec::new();
+    let mut code_end = end;
     while decoder.can_decode() {
         let instruction = decoder.decode();
+        if instruction.ip() >= code_end {
+            break;
+        }
         if instruction.is_invalid()
             || instruction.mnemonic() != Mnemonic::Jmp
             || instruction.op0_kind() != OpKind::Memory
@@ -898,33 +917,61 @@ fn discover_x86_jump_tables(bytes: &[u8], start: u64, end: u64) -> Vec<JumpTable
             continue;
         }
         let table_start = instruction.memory_displacement64();
-        if table_start < start || table_start >= end {
+        if table_start < start || table_start >= next_function {
             continue;
         }
         let offsets = decoder.get_constant_offsets(&instruction);
         if offsets.displacement_size() != 4 {
             continue;
         }
-        let table_off = (table_start - start) as usize;
+        dispatches.push((
+            table_start,
+            instruction.ip(),
+            instruction.ip() + offsets.displacement_offset() as u64,
+        ));
+        code_end = code_end.min(table_start);
+    }
+    dispatches.sort_unstable_by_key(|&(table, _, _)| table);
+
+    let mut tables = Vec::new();
+    let mut index = 0;
+    while index < dispatches.len() {
+        let table_start = dispatches[index].0;
+        let dispatch = dispatches[index].1;
+        let dispatch_addr = dispatches[index].2;
+        let mut dispatch_addrs = Vec::new();
+        index += 1;
+        while index < dispatches.len() && dispatches[index].0 == table_start {
+            dispatch_addrs.push(dispatches[index].2);
+            index += 1;
+        }
+        let table_limit = dispatches
+            .get(index)
+            .map_or(next_function, |&(next_table, _, _)| next_table)
+            .min(next_function);
         let mut entries = Vec::new();
-        let mut entry_off = table_off;
-        while entry_off + 4 <= bytes.len() {
-            let target =
-                u32::from_le_bytes(bytes[entry_off..entry_off + 4].try_into().unwrap()) as u64;
-            if target < start || target >= table_start {
+        let mut entry_addr = table_start;
+        while entry_addr.saturating_add(4) <= table_limit {
+            let entry_rva = entry_addr.wrapping_sub(model.image_base);
+            let Some(raw) = pe.data_at_rva(entry_rva, 4) else {
+                break;
+            };
+            let target = u32::from_le_bytes(raw.try_into().unwrap()) as u64;
+            if !(start..end).contains(&target) {
                 break;
             }
             entries.push(crate::JumpTableEntry {
-                addr: start + entry_off as u64,
+                addr: entry_addr,
                 target,
             });
-            entry_off += 4;
+            entry_addr += 4;
         }
         if !entries.is_empty() {
             tables.push(JumpTable {
                 owner: start,
-                dispatch: instruction.ip(),
-                dispatch_addr: Some(instruction.ip() + offsets.displacement_offset() as u64),
+                dispatch,
+                dispatch_addr: Some(dispatch_addr),
+                dispatch_addrs,
                 start: table_start,
                 entry_size: 4,
                 entries,
@@ -1616,12 +1663,113 @@ mod tests {
         bytes[16..20].copy_from_slice(&0x1008u32.to_le_bytes());
         bytes[20..24].copy_from_slice(&0x1009u32.to_le_bytes());
 
-        let tables = discover_x86_jump_tables(&bytes, 0x1000, 0x1018);
+        let model = IdaModel {
+            arch: IdaArch::X86,
+            procname: "metapc".into(),
+            bits: 32,
+            little_endian: true,
+            image_base: 0x1000,
+            filetype: "PE".into(),
+            input_file: "test.exe".into(),
+            sections: vec![crate::Section {
+                name: ".text".into(),
+                start: 0x1000,
+                end: 0x1018,
+                read: true,
+                write: false,
+                exec: true,
+                class: SegClass::Code,
+            }],
+            functions: vec![Function {
+                start: 0x1000,
+                end: 0x1018,
+                name: "switch".into(),
+                thunk: false,
+                lib: false,
+                is_static: false,
+                public: true,
+            }],
+            names: vec![],
+            relocations: vec![],
+            jump_tables: vec![],
+        };
+        let pe = PeImage {
+            arch: PeArch::X86,
+            image_base: 0x1000,
+            sections: vec![PeSection {
+                name: ".text".into(),
+                rva: 0,
+                va: 0x1000,
+                virtual_size: bytes.len() as u64,
+                data: bytes.clone(),
+                characteristics: 0,
+            }],
+            base_relocations: vec![],
+        };
+        let tables = discover_x86_jump_tables(&bytes, 0x1000, 0x1018, &model, &pe);
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].start, 0x1010);
         assert_eq!(tables[0].dispatch_addr, Some(0x1003));
         assert_eq!(tables[0].entries.len(), 2);
         assert_eq!(tables[0].entries[1].target, 0x1009);
+    }
+
+    #[test]
+    fn discovers_legacy_x86_table_after_ida_function_end() {
+        let mut image = vec![0x90; 32];
+        image[..7].copy_from_slice(&[0xFF, 0x24, 0x85, 0x10, 0x10, 0, 0]);
+        image[16..20].copy_from_slice(&0x1002u32.to_le_bytes());
+        image[20..24].copy_from_slice(&0x1007u32.to_le_bytes());
+        let code = image[..8].to_vec();
+        let model = IdaModel {
+            arch: IdaArch::X86,
+            procname: "metapc".into(),
+            bits: 32,
+            little_endian: true,
+            image_base: 0x1000,
+            filetype: "PE".into(),
+            input_file: "test.exe".into(),
+            sections: vec![crate::Section {
+                name: ".text".into(),
+                start: 0x1000,
+                end: 0x1020,
+                read: true,
+                write: false,
+                exec: true,
+                class: SegClass::Code,
+            }],
+            functions: vec![Function {
+                start: 0x1000,
+                end: 0x1008,
+                name: "switch".into(),
+                thunk: false,
+                lib: false,
+                is_static: false,
+                public: true,
+            }],
+            names: vec![],
+            relocations: vec![],
+            jump_tables: vec![],
+        };
+        let pe = PeImage {
+            arch: PeArch::X86,
+            image_base: 0x1000,
+            sections: vec![PeSection {
+                name: ".text".into(),
+                rva: 0,
+                va: 0x1000,
+                virtual_size: image.len() as u64,
+                data: image,
+                characteristics: 0,
+            }],
+            base_relocations: vec![],
+        };
+
+        let tables = discover_x86_jump_tables(&code, 0x1000, 0x1008, &model, &pe);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].start, 0x1010);
+        assert_eq!(tables[0].end(), 0x1018);
+        assert_eq!(tables[0].entries[1].target, 0x1007);
     }
 
     #[test]
