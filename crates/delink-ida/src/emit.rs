@@ -14,8 +14,8 @@ use anyhow::{anyhow, Context, Result};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 use object::write::{Mangling, Object, Relocation, SectionId, Symbol, SymbolId, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
-    SymbolScope,
+    Architecture, BinaryFormat, Endianness, Object as _, ObjectSymbol as _, RelocationFlags,
+    SectionKind, SymbolFlags, SymbolKind, SymbolScope,
 };
 use rayon::prelude::*;
 
@@ -356,7 +356,7 @@ fn emit_shared_excluding(
         stats.relocations += 1;
     }
 
-    let bytes = obj.write().context("serialize shared object")?;
+    let bytes = write_object_with_split_meta(&mut obj, model)?;
     write_file(out_path, &bytes)?;
     Ok(stats)
 }
@@ -845,7 +845,7 @@ fn emit_object(
     stats.local_symbols = local.len();
     stats.undef_symbols = undef.len();
 
-    let out = obj.write().context("serialize object")?;
+    let out = write_object_with_split_meta(&mut obj, model)?;
     write_file(out_path, &out)?;
     Ok(stats)
 }
@@ -1428,6 +1428,110 @@ fn sanitize_symbol_name(name: &str) -> Vec<u8> {
     name.as_bytes().to_vec()
 }
 
+fn original_symbol_va(model: &IdaModel, name: &str) -> Option<u64> {
+    model
+        .functions
+        .iter()
+        .find(|function| function.name == name)
+        .map(|function| function.start)
+        .or_else(|| {
+            model
+                .names
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .map(|symbol| symbol.addr)
+        })
+        .or_else(|| {
+            model
+                .jump_tables
+                .iter()
+                .find(|table| table.name == name)
+                .map(|table| table.start)
+        })
+        .or_else(|| {
+            name.strip_prefix("$L_")
+                .or_else(|| name.strip_prefix("jpt_"))
+                .and_then(|value| u64::from_str_radix(value, 16).ok())
+        })
+        .or_else(|| {
+            name.strip_prefix("__delink_ida_")
+                .and_then(|value| value.rsplit_once('_'))
+                .and_then(|(_, value)| u64::from_str_radix(value, 16).ok())
+        })
+        .or_else(|| match name {
+            SYM_CONST_START => model
+                .sections
+                .iter()
+                .find(|section| section.class == SegClass::Const)
+                .map(|section| section.start),
+            SYM_DATA_START => model
+                .sections
+                .iter()
+                .find(|section| section.class == SegClass::Data)
+                .map(|section| section.start),
+            SYM_BSS_START => model
+                .sections
+                .iter()
+                .find(|section| section.class == SegClass::Bss)
+                .map(|section| section.start),
+            _ => None,
+        })
+}
+
+fn split_meta_note(virtual_addresses: &[u64], is_64: bool) -> Result<Vec<u8>> {
+    let width = if is_64 { 8 } else { 4 };
+    let desc_size = virtual_addresses
+        .len()
+        .checked_mul(width)
+        .ok_or_else(|| anyhow!("split metadata is too large"))?;
+    let desc_size = u32::try_from(desc_size).context("split metadata is too large")?;
+    let mut note = Vec::with_capacity(20 + desc_size as usize);
+    note.extend_from_slice(&6u32.to_le_bytes()); // "Split" plus NUL
+    note.extend_from_slice(&desc_size.to_le_bytes());
+    note.extend_from_slice(&u32::from_be_bytes(*b"VIRT").to_le_bytes());
+    note.extend_from_slice(b"Split\0\0\0");
+    for &address in virtual_addresses {
+        if is_64 {
+            note.extend_from_slice(&address.to_le_bytes());
+        } else {
+            note.extend_from_slice(&(address as u32).to_le_bytes());
+        }
+    }
+    Ok(note)
+}
+
+/// Attach objdiff/decomp-toolkit split metadata. The VIRT array is indexed by
+/// the raw object symbol-table index, including any COFF auxiliary-symbol gaps.
+fn write_object_with_split_meta(obj: &mut Object<'_>, model: &IdaModel) -> Result<Vec<u8>> {
+    // COFF has no native NOTE section kind. A discardable "other" section is
+    // ignored by normal linking/diffing, while objdiff recognizes it by name.
+    let note_sid = obj.add_section(Vec::new(), b".note.split".to_vec(), SectionKind::Other);
+    let provisional = obj.write().context("serialize object for split metadata")?;
+    let file =
+        object::File::parse(provisional.as_slice()).context("parse object for split metadata")?;
+    let symbol_count = file
+        .symbols()
+        .map(|symbol| symbol.index().0 + 1)
+        .max()
+        .unwrap_or(0);
+    let mut virtual_addresses = vec![0u64; symbol_count];
+    for symbol in file.symbols() {
+        if symbol.is_undefined() {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if let Some(address) = original_symbol_va(model, name) {
+            virtual_addresses[symbol.index().0] = address;
+        }
+    }
+    drop(file);
+    let note = split_meta_note(&virtual_addresses, model.bits == 64)?;
+    obj.append_section_data(note_sid, &note, 4);
+    obj.write().context("serialize object")
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -1442,7 +1546,7 @@ mod tests {
 
     use crate::idapro_json::DataRange;
     use delink_pe::{PeArch, PeSection};
-    use object::{Object as _, ObjectSection as _};
+    use object::ObjectSection as _;
 
     fn test_model() -> (IdaModel, PeImage, IdaSymbols) {
         let model = IdaModel {
@@ -1518,6 +1622,17 @@ mod tests {
         assert_eq!(tables[0].dispatch_addr, Some(0x1003));
         assert_eq!(tables[0].entries.len(), 2);
         assert_eq!(tables[0].entries[1].target, 0x1009);
+    }
+
+    #[test]
+    fn split_metadata_serializes_coff_symbol_virtual_addresses() {
+        let note = split_meta_note(&[0x401000, 0x401020], false).unwrap();
+        assert_eq!(&note[0..4], &6u32.to_le_bytes());
+        assert_eq!(&note[4..8], &8u32.to_le_bytes());
+        assert_eq!(&note[8..12], &u32::from_be_bytes(*b"VIRT").to_le_bytes());
+        assert_eq!(&note[12..20], b"Split\0\0\0");
+        assert_eq!(&note[20..24], &0x401000u32.to_le_bytes());
+        assert_eq!(&note[24..28], &0x401020u32.to_le_bytes());
     }
 
     fn section_data(path: &Path, name: &str) -> Vec<u8> {

@@ -30,7 +30,9 @@ has to link against IDA:
    deterministic `byte_`/`word_`/`dword_`/`qword_` names so they can be edited
    in the exported JSON. Switch metadata is independent of function bounds, so
    a table after the final instruction is still emitted as relocatable data.
-   The export carries **no bytes**:
+   Emitted objects also carry objdiff-compatible `.note.split` metadata so
+   symbols can be displayed with their original virtual addresses. The export
+   carries **no bytes**:
 
    ```shell
    # headless (idat64.exe for a 64-bit database)
