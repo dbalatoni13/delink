@@ -54,11 +54,12 @@ import ida_name
 import ida_nalt
 import ida_segment
 import ida_ua
+import ida_xref
 import idaapi
 import idautils
 import idc
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 BADADDR = idaapi.BADADDR
 
@@ -232,6 +233,90 @@ def export_functions():
                 "thunk_target": _thunk_target(func) if is_thunk else None,
             }
         )
+    return out
+
+
+def _switch_dispatch_field(ea, jumps):
+    """Return the encoded address field that names a switch table."""
+    insn = ida_ua.insn_t()
+    if ida_ua.decode_insn(insn, ea) <= 0:
+        return None
+    data_refs = {int(ref) for ref in idautils.DataRefsFrom(ea)}
+    for op in insn.ops:
+        if op.type == ida_ua.o_void:
+            break
+        if op.offb == 0:
+            continue
+        if int(op.addr) == jumps or jumps in data_refs:
+            return int(ea + op.offb)
+    return None
+
+
+def export_jump_tables(_ptr_size):
+    """Export IDA switch metadata independently of function boundaries.
+
+    A compiler may place the table inside the range IDA assigned to a function,
+    or immediately after its last instruction.  Recording the range explicitly
+    lets delink avoid disassembling data and extend the emitted function when
+    the latter layout is used.
+    """
+    out = []
+    seen = set()
+    for func_ea in idautils.Functions():
+        func = ida_funcs.get_func(func_ea)
+        if func is None:
+            continue
+        for ea in idautils.FuncItems(func.start_ea):
+            si = ida_nalt.switch_info_t()
+            try:
+                if ida_nalt.get_switch_info(si, ea) <= 0:
+                    continue
+            except Exception:
+                continue
+            jumps = int(si.jumps)
+            count = int(si.get_jtable_size())
+            elem_size = int(si.get_jtable_element_size())
+            key = (int(func.start_ea), jumps)
+            if jumps == BADADDR or count <= 0 or elem_size not in (4, 8) or key in seen:
+                continue
+            seen.add(key)
+
+            calculated = []
+            try:
+                calculated = [int(x) for x in ida_xref.calc_switch_cases(ea, si).targets]
+            except Exception:
+                pass
+
+            entries = []
+            for index in range(count):
+                entry_ea = jumps + index * elem_size
+                refs = [int(x) for x in idautils.DataRefsFrom(entry_ea)]
+                refs.extend(int(x) for x in idautils.CodeRefsFrom(entry_ea, False))
+                target = refs[0] if refs else None
+                if target is None and index < len(calculated):
+                    target = calculated[index]
+                if target is None:
+                    # Absolute tables are the normal x86 form. Relative/custom
+                    # tables should have xrefs or calculated switch targets.
+                    target = int(
+                        ida_bytes.get_qword(entry_ea)
+                        if elem_size == 8
+                        else ida_bytes.get_dword(entry_ea)
+                    )
+                entries.append({"addr": int(entry_ea), "target": target})
+
+            out.append(
+                {
+                    "owner": int(func.start_ea),
+                    "dispatch": int(ea),
+                    "dispatch_addr": _switch_dispatch_field(ea, jumps),
+                    "start": jumps,
+                    "entry_size": elem_size,
+                    "entries": entries,
+                    "name": ida_name.get_name(jumps) or ("jpt_%X" % jumps),
+                }
+            )
+    out.sort(key=lambda item: (item["owner"], item["start"]))
     return out
 
 
@@ -486,7 +571,9 @@ def build_relocations(ptr_size):
 def build_model():
     procname = _procname()
     bits = _app_bits()
-    relocations = build_relocations(8 if bits == 64 else 4)
+    ptr_size = 8 if bits == 64 else 4
+    jump_tables = export_jump_tables(ptr_size)
+    relocations = build_relocations(ptr_size)
     return {
         "delink_ida_version": SCHEMA_VERSION,
         "meta": {
@@ -502,6 +589,7 @@ def build_model():
         },
         "segments": export_segments(),
         "functions": export_functions(),
+        "jump_tables": jump_tables,
         "names": export_names(relocations),
         "relocations": relocations,
     }

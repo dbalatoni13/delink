@@ -22,12 +22,15 @@ has to link against IDA:
 
 1. **Export** (inside IDA 9.x). Run [`crates/delink-ida/ida_export.py`](crates/delink-ida/ida_export.py)
    to write a small, human-readable JSON describing the architecture/segment
-   layout, every function (boundaries + flags), the full address → name map, and
-   the relocations IDA knows (its fixup table **and** offset-typed operands —
+   layout, every function (boundaries + flags), switch-table ownership and
+   bounds, the full address → name map, and the relocations IDA knows (its
+   fixup table **and** offset-typed operands —
    the latter being the only relocation record for images with no `.reloc`,
    e.g. EXEs). Unnamed data targets referenced by those relocations receive
    deterministic `byte_`/`word_`/`dword_`/`qword_` names so they can be edited
-   in the exported JSON. The export carries **no bytes**:
+   in the exported JSON. Switch metadata is independent of function bounds, so
+   a table after the final instruction is still emitted as relocatable data.
+   The export carries **no bytes**:
 
    ```shell
    # headless (idat64.exe for a 64-bit database)

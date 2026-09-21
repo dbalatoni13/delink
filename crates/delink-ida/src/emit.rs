@@ -11,6 +11,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
+use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 use object::write::{Mangling, Object, Relocation, SectionId, Symbol, SymbolId, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
@@ -20,7 +21,7 @@ use rayon::prelude::*;
 
 use crate::idapro_json::{IdaproJson, ObjectGroup};
 use crate::resolver::{IdaSymbols, SYM_BSS_START, SYM_CONST_START, SYM_DATA_START};
-use crate::{Function, IdaArch, IdaModel, PeImage, SegClass};
+use crate::{Function, IdaArch, IdaModel, JumpTable, PeImage, SegClass};
 
 /// Read `len` bytes at `rva` from the original binary, zero-padding any tail not
 /// backed by raw section data (e.g. virtual-size padding).
@@ -427,7 +428,52 @@ fn emit_object(
         let name = &f.name;
         let start = f.start;
         let end = f.end;
-        let size = f.size();
+        let owner_section = model.section_for(start);
+        let mut tables: Vec<JumpTable> = model
+            .jump_tables
+            .iter()
+            .filter(|table| {
+                model.arch == IdaArch::X86
+                    && table.owner == start
+                    && owner_section.is_some_and(|owner| {
+                        owner.class == SegClass::Code
+                            && model.section_for(table.start).is_some_and(|section| {
+                                section.start == owner.start && section.end == owner.end
+                            })
+                    })
+            })
+            .cloned()
+            .collect();
+        if tables.is_empty() && model.arch == IdaArch::X86 {
+            let base_size = f.size();
+            if let Some(orig) =
+                pe.data_at_rva(start.wrapping_sub(model.image_base), base_size as usize)
+            {
+                tables = discover_x86_jump_tables(orig, start, end);
+            }
+        }
+        tables.sort_by_key(|table| table.start);
+        for (index, table) in tables.iter().enumerate() {
+            if table.start < start
+                || table.entry_size == 0
+                || owner_section.is_some_and(|section| table.end() > section.end)
+                || table
+                    .dispatch_addr
+                    .is_some_and(|field| field < start || field.saturating_add(4) > end)
+                || table.entries.iter().enumerate().any(|(i, entry)| {
+                    entry.addr != table.start + i as u64 * table.entry_size as u64
+                })
+                || index > 0 && tables[index - 1].end() > table.start
+            {
+                return Err(anyhow!(
+                    "invalid inline jump table '{}' owned by '{}'",
+                    table.name,
+                    name
+                ));
+            }
+        }
+        let emit_end = tables.iter().fold(end, |end, table| end.max(table.end()));
+        let size = emit_end - start;
         let rva = start.wrapping_sub(model.image_base);
         let Some(orig) = pe.data_at_rva(rva, size as usize) else {
             tracing::warn!(
@@ -438,8 +484,47 @@ fn emit_object(
         let mut bytes = orig.to_vec();
         stats.text_bytes += size;
 
-        // 1) iced-x86 recovery → rel32 relocations.
-        let recovered = recover(model, &bytes, start, size, symbols, owned_ranges)?;
+        // 1) iced-x86 recovery → rel32 relocations. Switch-table ranges are
+        // data even when IDA included them in func.end_ea, and a table after
+        // func.end_ea extends emission without extending disassembly.
+        let mut recovered = Recovered::default();
+        let mut cursor = start;
+        for table in &tables {
+            let table_start = table.start.max(start).min(end);
+            if cursor < table_start {
+                let off = (cursor - start) as usize;
+                let span_size = table_start - cursor;
+                let mut part = recover(
+                    model,
+                    &bytes[off..off + span_size as usize],
+                    cursor,
+                    span_size,
+                    symbols,
+                    owned_ranges,
+                )?;
+                for reloc in &mut part.relocs {
+                    reloc.offset += cursor - start;
+                }
+                recovered.append(part);
+            }
+            cursor = cursor.max(table.end().min(end));
+        }
+        if cursor < end {
+            let off = (cursor - start) as usize;
+            let span_size = end - cursor;
+            let mut part = recover(
+                model,
+                &bytes[off..off + span_size as usize],
+                cursor,
+                span_size,
+                symbols,
+                owned_ranges,
+            )?;
+            for reloc in &mut part.relocs {
+                reloc.offset += cursor - start;
+            }
+            recovered.append(part);
+        }
         stats.instructions += recovered.instructions;
         stats.unresolved_calls += recovered.unresolved_calls;
         stats.unresolved_rip += recovered.unresolved_rip;
@@ -452,7 +537,20 @@ fn emit_object(
 
         // 2) IDA fixup table → absolute relocations within this function.
         let mut abs: Vec<(u64, String, i64, RelocationFlags)> = Vec::new();
-        for r in symbols.relocs_in(start..end) {
+        let switch_fields: HashSet<u64> = tables
+            .iter()
+            .flat_map(|table| {
+                table
+                    .entries
+                    .iter()
+                    .map(|entry| entry.addr)
+                    .chain(table.dispatch_addr)
+            })
+            .collect();
+        for r in symbols.relocs_in(start..emit_end) {
+            if switch_fields.contains(&r.addr) {
+                continue;
+            }
             let Some(flags) = abs_flags(format, model.arch, r.size) else {
                 continue;
             };
@@ -464,6 +562,22 @@ fn emit_object(
             if let Some((tname, addend)) = resolve_split_data(symbols, owned_ranges, r.target) {
                 bytes[off..off + w].fill(0);
                 abs.push((off as u64, tname, addend, flags));
+            }
+        }
+
+        for table in &tables {
+            if let Some(field) = table.dispatch_addr {
+                let off = (field - start) as usize;
+                if off + 4 <= bytes.len() {
+                    bytes[off..off + 4].fill(0);
+                }
+            }
+            for entry in &table.entries {
+                let off = (entry.addr - start) as usize;
+                let width = table.entry_size as usize;
+                if off + width <= bytes.len() {
+                    bytes[off..off + width].fill(0);
+                }
             }
         }
 
@@ -485,6 +599,88 @@ fn emit_object(
             flags: SymbolFlags::None,
         });
         local.insert(name.clone(), sym_id);
+
+        // Switch tables live in .text but are data. Give the table and every
+        // case destination first-class local symbols, then relocate the
+        // dispatch field and all entries to those symbols.
+        for table in &tables {
+            if table.start < start || table.end() > emit_end {
+                return Err(anyhow!(
+                    "jump table '{}' [{:#x}, {:#x}) is outside its owner '{}'",
+                    table.name,
+                    table.start,
+                    table.end(),
+                    name
+                ));
+            }
+            let table_off = table.start - start;
+            let table_id = obj.add_symbol(Symbol {
+                name: sanitize_symbol_name(&table.name),
+                value: fn_off + table_off,
+                size: 0,
+                // Keep this as a label, matching MSVC's `$L...` switch-table
+                // anchor. A COFF data symbol makes objdiff infer that the
+                // function ends here, hiding the table from its function view.
+                kind: SymbolKind::Label,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: SymbolSection::Section(sid),
+                flags: SymbolFlags::None,
+            });
+            local.insert(table.name.clone(), table_id);
+
+            if let Some(field) = table.dispatch_addr {
+                let off = (field - start) as usize;
+                if off + 4 <= bytes.len() {
+                    if let Some(flags) = abs_flags(format, model.arch, 4) {
+                        pending.push(Pending {
+                            sid,
+                            offset: fn_off + off as u64,
+                            sym: table.name.clone(),
+                            addend: 0,
+                            flags,
+                        });
+                    }
+                }
+            }
+
+            for entry in &table.entries {
+                let off = (entry.addr - start) as usize;
+                let width = table.entry_size as usize;
+                if off + width > bytes.len() {
+                    continue;
+                }
+                let (label, addend) = if (start..emit_end).contains(&entry.target) {
+                    let label = format!("$L_{:X}", entry.target);
+                    local.entry(label.clone()).or_insert_with(|| {
+                        obj.add_symbol(Symbol {
+                            name: sanitize_symbol_name(&label),
+                            value: fn_off + entry.target - start,
+                            size: 0,
+                            kind: SymbolKind::Label,
+                            scope: SymbolScope::Compilation,
+                            weak: false,
+                            section: SymbolSection::Section(sid),
+                            flags: SymbolFlags::None,
+                        })
+                    });
+                    (label, 0)
+                } else if let Some(target) = symbols.resolve_code(entry.target) {
+                    target
+                } else {
+                    continue;
+                };
+                if let Some(flags) = abs_flags(format, model.arch, table.entry_size) {
+                    pending.push(Pending {
+                        sid,
+                        offset: fn_off + off as u64,
+                        sym: label,
+                        addend,
+                        flags,
+                    });
+                }
+            }
+        }
 
         for (off, tname, addend, flags) in abs {
             pending.push(Pending {
@@ -658,11 +854,21 @@ fn emit_object(
 // iced-x86 recovery (arch-dispatched, normalised to a single reloc shape)
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct Recovered {
     relocs: Vec<RecRel>,
     instructions: usize,
     unresolved_calls: usize,
     unresolved_rip: usize,
+}
+
+impl Recovered {
+    fn append(&mut self, mut other: Recovered) {
+        self.relocs.append(&mut other.relocs);
+        self.instructions += other.instructions;
+        self.unresolved_calls += other.unresolved_calls;
+        self.unresolved_rip += other.unresolved_rip;
+    }
 }
 
 struct RecRel {
@@ -674,6 +880,59 @@ struct RecRel {
 struct SplitResolver<'a> {
     symbols: &'a IdaSymbols,
     owned_ranges: &'a [OwnedDataRange],
+}
+
+/// Backward compatibility for schema-v1 exports: recognize the conventional
+/// x86 `jmp [index*4 + table]` form and scan its absolute case pointers. New
+/// exports use IDA's authoritative switch metadata instead.
+fn discover_x86_jump_tables(bytes: &[u8], start: u64, end: u64) -> Vec<JumpTable> {
+    let mut decoder = Decoder::with_ip(32, bytes, start, DecoderOptions::NONE);
+    let mut tables = Vec::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid()
+            || instruction.mnemonic() != Mnemonic::Jmp
+            || instruction.op0_kind() != OpKind::Memory
+            || instruction.memory_index_scale() != 4
+        {
+            continue;
+        }
+        let table_start = instruction.memory_displacement64();
+        if table_start < start || table_start >= end {
+            continue;
+        }
+        let offsets = decoder.get_constant_offsets(&instruction);
+        if offsets.displacement_size() != 4 {
+            continue;
+        }
+        let table_off = (table_start - start) as usize;
+        let mut entries = Vec::new();
+        let mut entry_off = table_off;
+        while entry_off + 4 <= bytes.len() {
+            let target =
+                u32::from_le_bytes(bytes[entry_off..entry_off + 4].try_into().unwrap()) as u64;
+            if target < start || target >= table_start {
+                break;
+            }
+            entries.push(crate::JumpTableEntry {
+                addr: start + entry_off as u64,
+                target,
+            });
+            entry_off += 4;
+        }
+        if !entries.is_empty() {
+            tables.push(JumpTable {
+                owner: start,
+                dispatch: instruction.ip(),
+                dispatch_addr: Some(instruction.ip() + offsets.displacement_offset() as u64),
+                start: table_start,
+                entry_size: 4,
+                entries,
+                name: format!("jpt_{table_start:X}"),
+            });
+        }
+    }
+    tables
 }
 
 impl delink_x86::recover::SymbolResolver for SplitResolver<'_> {
@@ -1217,6 +1476,7 @@ mod tests {
             functions: vec![],
             names: vec![],
             relocations: vec![],
+            jump_tables: vec![],
         };
         let pe = PeImage {
             arch: PeArch::X86_64,
@@ -1243,6 +1503,21 @@ mod tests {
         };
         let symbols = IdaSymbols::build(&model, &[]);
         (model, pe, symbols)
+    }
+
+    #[test]
+    fn discovers_legacy_x86_absolute_jump_table() {
+        let mut bytes = vec![0x90; 24];
+        bytes[..7].copy_from_slice(&[0xFF, 0x24, 0x85, 0x10, 0x10, 0, 0]);
+        bytes[16..20].copy_from_slice(&0x1008u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&0x1009u32.to_le_bytes());
+
+        let tables = discover_x86_jump_tables(&bytes, 0x1000, 0x1018);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].start, 0x1010);
+        assert_eq!(tables[0].dispatch_addr, Some(0x1003));
+        assert_eq!(tables[0].entries.len(), 2);
+        assert_eq!(tables[0].entries[1].target, 0x1009);
     }
 
     fn section_data(path: &Path, name: &str) -> Vec<u8> {
@@ -1422,6 +1697,7 @@ mod tests {
             ],
             names: vec![],
             relocations: vec![],
+            jump_tables: vec![],
         };
         let groups = BTreeMap::from([(
             "all.obj".into(),
@@ -1464,6 +1740,7 @@ mod tests {
             }],
             names: vec![],
             relocations: vec![],
+            jump_tables: vec![],
         };
         let groups = BTreeMap::from([(
             "partial.obj".into(),

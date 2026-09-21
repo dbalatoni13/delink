@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
 object = { workspace = true }
+iced-x86 = { workspace = true }
 delink-x86 = { workspace = true }
 delink-x86_64 = { workspace = true }
 delink-pe = { workspace = true }

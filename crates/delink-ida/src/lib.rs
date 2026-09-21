@@ -4,12 +4,15 @@
 //! IDA 9.x) and splits the analysed binary into relocatable objects.
 //!
 //! The JSON carries the architecture, every segment's bytes, every function
-//! (boundaries + flags), the full address → name map, and IDA's fixup table.
+//! (boundaries + flags), switch jump tables, the full address → name map, and
+//! IDA's fixup table.
 //! For x86 / x86-64 targets the emitter disassembles each function with
 //! iced-x86 (via [`delink_x86`] / [`delink_x86_64`]) to recover instruction
 //! relocations — rel32 calls/jumps and RIP-relative references — resolving each
 //! target address through the name map to build the correct label.  Absolute
-//! pointers (in code or data) come from IDA's fixup table.
+//! pointers (in code or data) come from IDA's fixup table. Switch metadata is
+//! kept separate from function bounds so trailing tables are emitted as data
+//! even when IDA ends the function at its final instruction.
 //!
 //! Like the Mach-O `symtab.json` flow, the split is driven by an editable
 //! `idapro.json` mapping each output object filename to explicit function start
@@ -140,6 +143,29 @@ pub struct Reloc {
     pub target: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct JumpTableEntry {
+    pub addr: u64,
+    pub target: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct JumpTable {
+    pub owner: u64,
+    pub dispatch: u64,
+    pub dispatch_addr: Option<u64>,
+    pub start: u64,
+    pub entry_size: u32,
+    pub entries: Vec<JumpTableEntry>,
+    pub name: String,
+}
+
+impl JumpTable {
+    pub fn end(&self) -> u64 {
+        self.start + self.entry_size as u64 * self.entries.len() as u64
+    }
+}
+
 /// The fully decoded model.
 pub struct IdaModel {
     pub arch: IdaArch,
@@ -153,6 +179,7 @@ pub struct IdaModel {
     pub functions: Vec<Function>,
     pub names: Vec<Name>,
     pub relocations: Vec<Reloc>,
+    pub jump_tables: Vec<JumpTable>,
 }
 
 impl IdaModel {
@@ -174,6 +201,8 @@ struct RawModel {
     functions: Vec<RawFunction>,
     names: Vec<RawName>,
     relocations: Vec<RawReloc>,
+    #[serde(default)]
+    jump_tables: Vec<RawJumpTable>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +266,23 @@ struct RawReloc {
     target: u64,
 }
 
+#[derive(Deserialize)]
+struct RawJumpTableEntry {
+    addr: u64,
+    target: u64,
+}
+
+#[derive(Deserialize)]
+struct RawJumpTable {
+    owner: u64,
+    dispatch: u64,
+    dispatch_addr: Option<u64>,
+    start: u64,
+    entry_size: u32,
+    entries: Vec<RawJumpTableEntry>,
+    name: String,
+}
+
 /// Load and decode an exported `*.delink.json` file.
 pub fn load(path: &Path) -> Result<IdaModel> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -294,6 +340,27 @@ pub fn load(path: &Path) -> Result<IdaModel> {
         })
         .collect();
 
+    let jump_tables = raw
+        .jump_tables
+        .into_iter()
+        .map(|table| JumpTable {
+            owner: table.owner,
+            dispatch: table.dispatch,
+            dispatch_addr: table.dispatch_addr,
+            start: table.start,
+            entry_size: table.entry_size,
+            entries: table
+                .entries
+                .into_iter()
+                .map(|entry| JumpTableEntry {
+                    addr: entry.addr,
+                    target: entry.target,
+                })
+                .collect(),
+            name: table.name,
+        })
+        .collect();
+
     Ok(IdaModel {
         arch: IdaArch::from_meta(&raw.meta.arch),
         procname: raw.meta.procname,
@@ -306,6 +373,7 @@ pub fn load(path: &Path) -> Result<IdaModel> {
         functions,
         names,
         relocations,
+        jump_tables,
     })
 }
 

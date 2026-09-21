@@ -280,6 +280,7 @@ dependencies = [
  "delink-pe",
  "delink-x86",
  "delink-x86_64",
+ "iced-x86",
  "object",
  "rayon",
  "serde",
