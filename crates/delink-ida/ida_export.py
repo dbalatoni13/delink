@@ -269,7 +269,13 @@ def export_jump_tables(_ptr_size):
         for ea in idautils.FuncItems(func.start_ea):
             si = ida_nalt.switch_info_t()
             try:
-                if ida_nalt.get_switch_info(si, ea) <= 0:
+                # IDA 9.2's Python compatibility wrapper returns ``si`` (or
+                # None) even when called with the legacy two-argument form;
+                # older releases returned an integer status. Accept both.
+                switch_result = ida_nalt.get_switch_info(si, ea)
+                if switch_result is None or switch_result is False:
+                    continue
+                if isinstance(switch_result, int) and switch_result <= 0:
                     continue
             except Exception:
                 continue
