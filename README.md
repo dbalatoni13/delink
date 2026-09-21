@@ -42,6 +42,19 @@ has to link against IDA:
    delink ida-split delink.ida.json binary.exe -o ./output
    ```
 
+   Original Xbox XBE files are supported by the same IDA workflow. Import the
+   `.xbe` with an XBE loader in IDA, run the exporter, then pass the original
+   XBE as the binary:
+
+   ```shell
+   delink ida-split game.ida.json default.xbe -o ./output
+   ```
+
+   XBE section bytes are read from the XBE section table, while absolute
+   relocations come from IDA's exported fixups (XBE files do not contain a PE
+   `.reloc` directory). The output is COFF `.obj` by default; use `--elf` when
+   an ELF `.o` is preferred.
+
    For **x86 / x86-64** targets delink disassembles each function with iced-x86
    to recover rel32 call/jump relocations, and combines IDA's relocations with
    the binary's `.reloc` table for absolute pointers, resolving every target

@@ -203,7 +203,9 @@ enum Cmd {
         /// Path to the JSON produced by `ida_export.py`.
         json: PathBuf,
         /// Path to the original input binary (the export carries no bytes; the
-        /// function/section bytes and the PE `.reloc` table come from here).
+        /// function/section bytes and any PE `.reloc` table come from here).
+        /// Original Xbox `.xbe` images are supported as well; their absolute
+        /// relocations come from IDA's fixup export.
         binary: PathBuf,
         /// Output directory for the objects.
         #[arg(short, long)]
@@ -1332,7 +1334,7 @@ fn cmd_ida_split(
     let relocs = delink_ida::combined_relocations(&model, &pe);
     let symbols = delink_ida::IdaSymbols::build(&model, &relocs);
     tracing::info!(
-        "ida-split: {} relocations ({} IDA fixups + {} PE .reloc, combined)",
+        "ida-split: {} relocations ({} IDA fixups + {} image base relocs, combined)",
         relocs.len(),
         model.relocations.len(),
         pe.base_relocations.len(),

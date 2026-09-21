@@ -172,8 +172,13 @@ impl PeImage {
     }
 }
 
-/// Parse a PE executable without a PDB: sections + image base + base relocations.
+/// Parse a PE executable or original Xbox XBE without a PDB: sections + image
+/// base + base relocations. XBE images have an empty base-relocation list.
 pub fn load_pe_image(exe_data: &[u8]) -> Result<PeImage> {
+    if exe_data.get(..4) == Some(b"XBEH") {
+        return load_xbe_image(exe_data);
+    }
+
     let (arch, image_base, sections) = parse_pe_sections(exe_data)?;
     let base_relocations = parse_base_relocations(&sections, image_base);
     Ok(PeImage {
@@ -182,6 +187,183 @@ pub fn load_pe_image(exe_data: &[u8]) -> Result<PeImage> {
         sections,
         base_relocations,
     })
+}
+
+/// Parse an original Xbox executable into the image representation used by the
+/// IDA importer.
+///
+/// XBE is not a PE file on disk: it has its own header and section table, but
+/// the section contents are still mapped into a 32-bit x86 address space.  An
+/// XBE has no PE base-relocation directory, so absolute relocations are
+/// supplied by IDA's fixup export instead.
+pub fn load_xbe_image(xbe_data: &[u8]) -> Result<PeImage> {
+    const XBE_HEADER_SIZE: usize = 0x178;
+    const XBE_SECTION_SIZE: usize = 0x38;
+    const XBE_MAGIC: &[u8; 4] = b"XBEH";
+
+    if xbe_data.len() < XBE_HEADER_SIZE {
+        return Err(anyhow!("file too small for XBE header"));
+    }
+    if &xbe_data[..4] != XBE_MAGIC {
+        return Err(anyhow!("not an XBE file (no XBEH signature)"));
+    }
+
+    // XBE image-header fields.  All addresses in the header are virtual
+    // addresses; section raw addresses are file offsets.
+    let image_base = read_u32(xbe_data, 0x104, "XBE base address")? as u64;
+    let size_of_headers = read_u32(xbe_data, 0x108, "XBE header size")? as u64;
+    let size_of_image = read_u32(xbe_data, 0x10c, "XBE image size")? as u64;
+    let section_count = read_u32(xbe_data, 0x11c, "XBE section count")? as usize;
+    let section_headers_addr = read_u32(xbe_data, 0x120, "XBE section headers address")? as u64;
+
+    if image_base == 0 {
+        return Err(anyhow!("XBE has a zero image base"));
+    }
+    let headers_end = image_base
+        .checked_add(size_of_headers)
+        .ok_or_else(|| anyhow!("XBE header address range overflows"))?;
+    if section_headers_addr < image_base || section_headers_addr >= headers_end {
+        return Err(anyhow!(
+            "XBE section headers address {section_headers_addr:#x} is outside the header image"
+        ));
+    }
+    let section_headers_offset = (section_headers_addr - image_base) as usize;
+    let section_headers_len = section_count
+        .checked_mul(XBE_SECTION_SIZE)
+        .ok_or_else(|| anyhow!("XBE section table size overflows"))?;
+    let section_headers_end = section_headers_offset
+        .checked_add(section_headers_len)
+        .ok_or_else(|| anyhow!("XBE section table offset overflows"))?;
+    if section_headers_end > xbe_data.len() || section_headers_end as u64 > size_of_headers as u64 {
+        return Err(anyhow!("XBE section headers are out of bounds"));
+    }
+
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        let offset = section_headers_offset + index * XBE_SECTION_SIZE;
+        let header = &xbe_data[offset..offset + XBE_SECTION_SIZE];
+
+        let flags = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let virtual_address = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+        let virtual_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+        let raw_address = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let raw_size = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let section_name_addr = u32::from_le_bytes(header[20..24].try_into().unwrap()) as u64;
+
+        let va = virtual_address;
+        let section_end = va
+            .checked_add(virtual_size)
+            .ok_or_else(|| anyhow!("XBE section {index} virtual range overflows"))?;
+        if size_of_image != 0 {
+            let image_end = image_base
+                .checked_add(size_of_image)
+                .ok_or_else(|| anyhow!("XBE image address range overflows"))?;
+            if va < image_base || section_end > image_end {
+                return Err(anyhow!(
+                    "XBE section {index} virtual range {va:#x}..{section_end:#x} is outside the image"
+                ));
+            }
+        }
+
+        let raw_end = raw_address
+            .checked_add(raw_size)
+            .ok_or_else(|| anyhow!("XBE section {index} raw range overflows"))?;
+        if raw_end > xbe_data.len() {
+            return Err(anyhow!("XBE section {index} raw data is out of bounds"));
+        }
+
+        let mut data = xbe_data[raw_address..raw_end].to_vec();
+        let virtual_size_usize = usize::try_from(virtual_size)
+            .map_err(|_| anyhow!("XBE section {index} virtual size is too large"))?;
+        if data.len() < virtual_size_usize {
+            data.resize(virtual_size_usize, 0);
+        }
+
+        let fallback_name = if flags & 0x04 != 0 {
+            ".text"
+        } else if flags & 0x01 != 0 {
+            ".data"
+        } else {
+            ".rdata"
+        };
+        let mut name =
+            xbe_cstr_at_virtual(xbe_data, image_base, size_of_headers, section_name_addr)
+                .unwrap_or_else(|| fallback_name.to_string());
+        if name.is_empty() {
+            name = fallback_name.to_string();
+        }
+        if sections
+            .iter()
+            .any(|section: &PeSection| section.name == name)
+        {
+            name = format!("{name}_{index}");
+        }
+
+        // Keep PE-style characteristics for callers that inspect them, while
+        // retaining the original XBE flags in the low bits.  The importer
+        // primarily uses the virtual/raw address mapping and the IDA model's
+        // section permissions.
+        let mut characteristics = flags;
+        if flags & 0x04 != 0 {
+            characteristics |= 0x0000_0020 | 0x2000_0000;
+        }
+        if flags & 0x01 != 0 {
+            characteristics |= 0x4000_0000 | 0x8000_0000;
+        }
+        if raw_size == 0 {
+            characteristics |= 0x0000_0080;
+        }
+
+        sections.push(PeSection {
+            name,
+            rva: va.checked_sub(image_base).ok_or_else(|| {
+                anyhow!("XBE section {index} virtual address precedes image base")
+            })?,
+            va,
+            virtual_size,
+            data,
+            characteristics,
+        });
+    }
+
+    Ok(PeImage {
+        arch: PeArch::X86,
+        image_base,
+        sections,
+        base_relocations: Vec::new(),
+    })
+}
+
+fn read_u32(data: &[u8], offset: usize, field: &str) -> Result<u32> {
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("{field} is out of bounds"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// Read an XBE virtual-addressed C string from the header image.  Section
+/// names are normally stored in the header area; keeping this helper limited
+/// to that area avoids accidentally interpreting an invalid name pointer as a
+/// section's code or data.
+fn xbe_cstr_at_virtual(
+    data: &[u8],
+    image_base: u64,
+    size_of_headers: u64,
+    address: u64,
+) -> Option<String> {
+    let offset = address
+        .checked_sub(image_base)
+        .and_then(|offset| usize::try_from(offset).ok())?;
+    let header_size = usize::try_from(size_of_headers).ok()?;
+    if offset >= header_size || offset >= data.len() {
+        return None;
+    }
+    let end = data[offset..header_size.min(data.len())]
+        .iter()
+        .position(|&byte| byte == 0)
+        .map(|relative| offset + relative)
+        .unwrap_or_else(|| header_size.min(data.len()));
+    Some(String::from_utf8_lossy(&data[offset..end]).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -500,4 +682,84 @@ pub(crate) fn rva_cstr(sections: &[PeSection], rva: u64) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn loads_xbe_sections_as_an_x86_image() {
+        let base = 0x10000u32;
+        let headers_size = 0x400u32;
+        let mut bytes = vec![0u8; 0x420];
+        bytes[..4].copy_from_slice(b"XBEH");
+        put_u32(&mut bytes, 0x104, base);
+        put_u32(&mut bytes, 0x108, headers_size);
+        put_u32(&mut bytes, 0x10c, 0x30000);
+        put_u32(&mut bytes, 0x11c, 2);
+        put_u32(&mut bytes, 0x120, base + 0x178);
+
+        bytes[0x200..0x206].copy_from_slice(b".text\0");
+        bytes[0x208..0x20e].copy_from_slice(b".data\0");
+
+        // Section 0: executable code with a zero-filled virtual tail.
+        put_u32(&mut bytes, 0x178, 0x06);
+        put_u32(&mut bytes, 0x17c, base + 0x1000);
+        put_u32(&mut bytes, 0x180, 8);
+        put_u32(&mut bytes, 0x184, 0x400);
+        put_u32(&mut bytes, 0x188, 4);
+        put_u32(&mut bytes, 0x18c, base + 0x200);
+        bytes[0x400..0x404].copy_from_slice(&[0x55, 0x8b, 0xec, 0xc3]);
+
+        // Section 1: writable data.
+        put_u32(&mut bytes, 0x1b0, 0x01);
+        put_u32(&mut bytes, 0x1b4, base + 0x2000);
+        put_u32(&mut bytes, 0x1b8, 4);
+        put_u32(&mut bytes, 0x1bc, 0x410);
+        put_u32(&mut bytes, 0x1c0, 4);
+        put_u32(&mut bytes, 0x1c4, base + 0x208);
+        bytes[0x410..0x414].copy_from_slice(&[1, 2, 3, 4]);
+
+        let image = load_pe_image(&bytes).unwrap();
+        assert_eq!(image.arch, PeArch::X86);
+        assert_eq!(image.image_base, base as u64);
+        assert!(image.base_relocations.is_empty());
+        assert_eq!(image.sections[0].name, ".text");
+        assert_eq!(image.sections[0].rva, 0x1000);
+        assert_eq!(
+            image.sections[0].data,
+            vec![0x55, 0x8b, 0xec, 0xc3, 0, 0, 0, 0]
+        );
+        assert_eq!(image.data_at_rva(0x1000, 8).unwrap().len(), 8);
+        assert_eq!(image.sections[1].name, ".data");
+        assert_eq!(image.data_at_rva(0x2000, 4).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_xbe_section_raw_data_outside_file() {
+        let base = 0x10000u32;
+        let mut bytes = vec![0u8; 0x200];
+        bytes[..4].copy_from_slice(b"XBEH");
+        put_u32(&mut bytes, 0x104, base);
+        put_u32(&mut bytes, 0x108, 0x200);
+        put_u32(&mut bytes, 0x10c, 0x20000);
+        put_u32(&mut bytes, 0x11c, 1);
+        put_u32(&mut bytes, 0x120, base + 0x178);
+        put_u32(&mut bytes, 0x178, 0x04);
+        put_u32(&mut bytes, 0x17c, base + 0x1000);
+        put_u32(&mut bytes, 0x180, 4);
+        put_u32(&mut bytes, 0x184, 0x1ff);
+        put_u32(&mut bytes, 0x188, 4);
+
+        let error = match load_xbe_image(&bytes) {
+            Ok(_) => panic!("malformed XBE unexpectedly loaded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("raw data is out of bounds"));
+    }
 }

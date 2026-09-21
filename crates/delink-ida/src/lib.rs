@@ -17,6 +17,10 @@
 //! / logical `.bss`
 //! address ranges. Names, bounds, and visibility always come from the exported
 //! model; see [`idapro_json`].
+//!
+//! The original input can be a PE image or an original Xbox XBE. XBE section
+//! bytes are loaded from the XBE section table, while absolute relocations come
+//! from the IDA export because XBE images do not carry a PE `.reloc` table.
 
 pub mod emit;
 pub mod idapro_json;
@@ -74,8 +78,9 @@ impl SegClass {
     }
 }
 
-/// A segment's metadata.  The bytes live in the original input binary, not in
-/// the export — read them through [`PeImage`] keyed by RVA.
+/// A segment's metadata. The bytes live in the original input binary, not in
+/// the export — read them through [`PeImage`] using image-base-relative
+/// addresses (PE RVAs or the equivalent XBE mapping).
 #[derive(Debug, Clone)]
 pub struct Section {
     pub name: String,
@@ -304,10 +309,12 @@ pub fn load(path: &Path) -> Result<IdaModel> {
     })
 }
 
-/// Load the original input binary (PE) whose bytes the split will carve up.
+/// Load the original input binary (PE or original Xbox XBE) whose bytes the
+/// split will carve up.
 pub fn load_binary(path: &Path) -> Result<PeImage> {
     let data = std::fs::read(path).with_context(|| format!("read binary {}", path.display()))?;
-    delink_pe::load_pe_image(&data).with_context(|| format!("parse PE {}", path.display()))
+    delink_pe::load_pe_image(&data)
+        .with_context(|| format!("parse PE/XBE image {}", path.display()))
 }
 
 /// The set of absolute-pointer relocations to apply, in IDA-VA space.
@@ -317,6 +324,9 @@ pub fn load_binary(path: &Path) -> Result<PeImage> {
 ///     whose images carry no `.reloc`), and
 ///   * the PE base-relocation table from the original binary (present in DLLs),
 ///     whose targets are read from the binary's own bytes.
+///
+/// XBE images do not have a PE base-relocation table, so their absolute
+/// relocations are supplied by the first source (IDA's fixup export).
 ///
 /// Both are translated into IDA's address space via the image-base delta so they
 /// resolve against the same name map.

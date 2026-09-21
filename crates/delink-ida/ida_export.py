@@ -20,10 +20,10 @@ Relocations are gathered from two IDA sources, deduplicated:
   * address-bearing code/data operands, including offset-typed operands and
     32-bit absolute memory references backed by IDA data xrefs -- the only
     relocation record for images with no relocation table, e.g. fixed-base
-    EXEs.
-delink additionally reads the PE `.reloc` table from the binary (present in the
-DLLs) and recovers rel32 calls/jumps with iced-x86, resolving every target
-address through the exported name map.
+    EXEs and original Xbox XBE files.
+delink additionally reads the PE `.reloc` table from the binary (present in
+DLLs; XBE inputs have no such table) and recovers rel32 calls/jumps with
+iced-x86, resolving every target address through the exported name map.
 
 Usage
 -----
