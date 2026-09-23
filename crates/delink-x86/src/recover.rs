@@ -5,20 +5,23 @@
 //!   * `E9 rel32`    (jmp rel32)    → IMAGE_REL_I386_REL32 at offset 1
 //!   * `0F 8x rel32` (jcc rel32)   → IMAGE_REL_I386_REL32 at offset 2
 //!
-//! 32-bit absolute pointer fixups (IMAGE_REL_I386_DIR32) are derived from the
-//! PE base-relocation table (HIGHLOW entries) and handled in the emitter, not
-//! here.
+//! Most 32-bit absolute pointer fixups come from the PE base-relocation table.
+//! The MSVC SEH `fs:[0]` access is an exception: its encoded displacement is
+//! zero in the linked image, but the source object relocates it to
+//! `__except_list`.
 //!
 //! Intra-function branches are skipped. Unresolved targets are counted.
 
 use anyhow::Result;
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, Register};
 use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocKind {
     /// IMAGE_REL_I386_REL32 — 32-bit PC-relative (calls, jumps).
     Rel32,
+    /// IMAGE_REL_I386_DIR32 — MSVC's `__except_list` at `fs:[0]`.
+    Dir32,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +61,11 @@ pub trait SymbolResolver {
     fn resolve_code(&self, va: u64) -> Option<(String, i64)>;
     /// Resolve a data reference → (symbol_name, addend).
     fn resolve_data(&self, va: u64) -> Option<(String, i64)>;
+    /// Resolve a zero displacement through FS, when the target ABI gives it a
+    /// named COFF symbol (MSVC x86 uses `__except_list`).
+    fn resolve_fs_zero(&self) -> Option<String> {
+        None
+    }
     /// Returns true if `target_va` is inside the current function body.
     fn is_intra_function(&self, fn_va: u64, fn_size: u64, target_va: u64) -> bool {
         target_va >= fn_va && target_va < fn_va + fn_size
@@ -104,6 +112,29 @@ pub fn recover<R: SymbolResolver>(
             out.rep_ret_offsets.push(insn_offset);
         }
 
+        // A linked PE retains the zero displacement in `fs:[0]`, so neither
+        // IDA nor the PE base-relocation table can recover this COFF symbol.
+        // Require an explicit 32-bit displacement and no base/index register:
+        // `fs:[eax]` and `fs:[4]` must not be treated as `__except_list`.
+        if insn.memory_segment() == Register::FS
+            && insn.memory_base() == Register::None
+            && insn.memory_index() == Register::None
+            && insn.memory_displacement64() == 0
+        {
+            let offsets = decoder.get_constant_offsets(&insn);
+            if offsets.displacement_size() == 4 {
+                if let Some(target) = resolver.resolve_fs_zero() {
+                    out.relocs.push(RecoveredReloc {
+                        offset: insn_offset + offsets.displacement_offset() as u64,
+                        pc,
+                        kind: RelocKind::Dir32,
+                        target,
+                        addend: 0,
+                    });
+                }
+            }
+        }
+
         // Only direct near branches (call rel32 / jmp rel32 / jcc rel32).
         // rel8 branches are 2 bytes; rel32 are 5 (E8/E9) or 6 (0F 8x) bytes.
         match insn.flow_control() {
@@ -142,4 +173,48 @@ pub fn recover<R: SymbolResolver>(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoSymbols(bool);
+
+    impl SymbolResolver for NoSymbols {
+        fn resolve_code(&self, _: u64) -> Option<(String, i64)> {
+            None
+        }
+
+        fn resolve_data(&self, _: u64) -> Option<(String, i64)> {
+            None
+        }
+
+        fn resolve_fs_zero(&self) -> Option<String> {
+            self.0.then(|| "__except_list".to_string())
+        }
+    }
+
+    #[test]
+    fn recovers_msvc_seh_exception_list_in_loads_and_stores() {
+        // mov eax, fs:[0]; mov fs:[0], esp; mov eax, fs:[4]; mov eax, gs:[0]
+        let bytes = [
+            0x64, 0xa1, 0, 0, 0, 0, 0x64, 0x89, 0x25, 0, 0, 0, 0, 0x64, 0xa1, 4, 0, 0, 0, 0x65,
+            0xa1, 0, 0, 0, 0,
+        ];
+        let result = recover(&bytes, 0x704230, bytes.len() as u64, &NoSymbols(true)).unwrap();
+        assert_eq!(result.relocs.len(), 2);
+        for (reloc, offset) in result.relocs.iter().zip([2, 9]) {
+            assert_eq!(reloc.offset, offset);
+            assert_eq!(reloc.kind, RelocKind::Dir32);
+            assert_eq!(reloc.target, "__except_list");
+            assert_eq!(reloc.addend, 0);
+        }
+        assert!(
+            recover(&bytes, 0x704230, bytes.len() as u64, &NoSymbols(false))
+                .unwrap()
+                .relocs
+                .is_empty()
+        );
+    }
 }

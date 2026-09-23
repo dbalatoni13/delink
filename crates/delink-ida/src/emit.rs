@@ -692,12 +692,30 @@ fn emit_object(
             });
         }
         for r in &recovered.relocs {
+            // An explicit IDA fixup is authoritative; do not emit a second
+            // relocation if IDA already named this segmented field.
+            if r.absolute
+                && symbols
+                    .relocs_in(start + r.offset..start + r.offset + 1)
+                    .next()
+                    .is_some()
+            {
+                continue;
+            }
             pending.push(Pending {
                 sid,
                 offset: fn_off + r.offset,
                 sym: r.target.clone(),
-                addend: r.addend - REL32_FIELD_BYTES,
-                flags: rel32,
+                addend: if r.absolute {
+                    r.addend
+                } else {
+                    r.addend - REL32_FIELD_BYTES
+                },
+                flags: if r.absolute {
+                    abs_flags(format, model.arch, 4).expect("x86 absolute relocation is 32 bits")
+                } else {
+                    rel32
+                },
             });
         }
     }
@@ -875,11 +893,13 @@ struct RecRel {
     offset: u64,
     target: String,
     addend: i64,
+    absolute: bool,
 }
 
 struct SplitResolver<'a> {
     symbols: &'a IdaSymbols,
     owned_ranges: &'a [OwnedDataRange],
+    msvc_x86_pe: bool,
 }
 
 /// Backward compatibility for schema-v1 exports: recognize the conventional
@@ -990,6 +1010,10 @@ impl delink_x86::recover::SymbolResolver for SplitResolver<'_> {
     fn resolve_data(&self, va: u64) -> Option<(String, i64)> {
         resolve_split_data(self.symbols, self.owned_ranges, va)
     }
+
+    fn resolve_fs_zero(&self) -> Option<String> {
+        self.msvc_x86_pe.then(|| "__except_list".to_string())
+    }
 }
 
 impl delink_x86_64::recover::SymbolResolver for SplitResolver<'_> {
@@ -1013,6 +1037,7 @@ fn recover(
     let resolver = SplitResolver {
         symbols,
         owned_ranges,
+        msvc_x86_pe: model.arch == IdaArch::X86 && model.filetype.eq_ignore_ascii_case("PE"),
     };
     match model.arch {
         IdaArch::X86 => {
@@ -1025,6 +1050,7 @@ fn recover(
                         offset: x.offset,
                         target: x.target,
                         addend: x.addend,
+                        absolute: x.kind == delink_x86::RelocKind::Dir32,
                     })
                     .collect(),
                 instructions: r.diag.instructions,
@@ -1042,6 +1068,7 @@ fn recover(
                         offset: x.offset,
                         target: x.target,
                         addend: x.addend,
+                        absolute: false,
                     })
                     .collect(),
                 instructions: r.diag.instructions,
