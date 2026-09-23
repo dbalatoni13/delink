@@ -59,7 +59,7 @@ import idaapi
 import idautils
 import idc
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 BADADDR = idaapi.BADADDR
 
@@ -224,7 +224,7 @@ def export_functions():
         out.append(
             {
                 "start": int(func.start_ea),
-                "end": int(func.end_ea),
+                "size": "0x%X" % (int(func.end_ea) - int(func.start_ea)),
                 "name": ida_funcs.get_func_name(ea) or ("sub_%X" % ea),
                 "thunk": is_thunk,
                 "lib": bool(flags & ida_funcs.FUNC_LIB),
@@ -351,6 +351,7 @@ def export_names(relocations=None):
         ea = int(ea)
         known.add(ea)
         func = ida_funcs.get_func(ea)
+        seg = ida_segment.getseg(ea)
         out.append(
             {
                 "addr": ea,
@@ -358,6 +359,8 @@ def export_names(relocations=None):
                 "public": bool(ida_name.is_public_name(ea)),
                 "weak": bool(ida_name.is_weak_name(ea)),
                 "is_func": bool(func is not None and func.start_ea == ea),
+                **({"size": "0x%X" % max(1, int(ida_bytes.get_item_size(ea)))}
+                   if func is None and seg is not None and _seg_class(seg) in ("DATA", "CONST", "BSS") else {}),
             }
         )
 
@@ -389,10 +392,22 @@ def export_names(relocations=None):
                 "public": False,
                 "weak": False,
                 "is_func": False,
+                "size": "0x%X" % max(1, size),
             }
         )
 
     out.sort(key=lambda item: item["addr"])
+    # IDA can place a label inside an array or struct. Keep exported sizes
+    # disjoint while leaving the user free to expand a symbol after removing
+    # interior labels from the JSON.
+    for index, item in enumerate(out):
+        if "size" not in item:
+            continue
+        seg = ida_segment.getseg(item["addr"])
+        limit = int(seg.end_ea) if seg is not None else item["addr"] + 1
+        if index + 1 < len(out):
+            limit = min(limit, out[index + 1]["addr"])
+        item["size"] = "0x%X" % min(int(item["size"], 16), max(1, limit - item["addr"]))
     return out
 
 

@@ -31,7 +31,7 @@ pub mod resolver;
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
 pub use delink_pe::{BaseRelocKind, PeImage};
@@ -126,6 +126,8 @@ impl Function {
 #[derive(Debug, Clone)]
 pub struct Name {
     pub addr: u64,
+    /// Declared byte length of a data symbol (zero for code labels/legacy exports).
+    pub size: u64,
     pub name: String,
     pub public: bool,
     pub weak: bool,
@@ -245,7 +247,10 @@ struct RawSegment {
 #[derive(Deserialize)]
 struct RawFunction {
     start: u64,
-    end: u64,
+    #[serde(default)]
+    end: Option<u64>,
+    #[serde(default)]
+    size: Option<serde_json::Value>,
     name: String,
     thunk: bool,
     lib: bool,
@@ -259,6 +264,8 @@ struct RawFunction {
 #[derive(Deserialize)]
 struct RawName {
     addr: u64,
+    #[serde(default)]
+    size: Option<serde_json::Value>,
     name: String,
     public: bool,
     weak: bool,
@@ -291,13 +298,72 @@ struct RawJumpTable {
     name: String,
 }
 
+fn parse_size(value: &serde_json::Value) -> Result<u64> {
+    match value {
+        serde_json::Value::String(text) => {
+            let hex = text
+                .strip_prefix("0x")
+                .or_else(|| text.strip_prefix("0X"))
+                .context("size must be a hexadecimal string such as 0x4")?;
+            u64::from_str_radix(hex, 16).context("invalid hexadecimal size")
+        }
+        serde_json::Value::Number(number) => number.as_u64().context("size must be nonnegative"),
+        _ => bail!("size must be a hexadecimal string or integer"),
+    }
+}
+
+fn validate_data_symbols(sections: &[Section], names: &[Name]) -> Result<()> {
+    let mut data: Vec<&Name> = names
+        .iter()
+        .filter(|name| {
+            !name.is_func
+                && sections.iter().any(|section| {
+                    section.contains(name.addr)
+                        && matches!(
+                            section.class,
+                            SegClass::Data | SegClass::Const | SegClass::Bss
+                        )
+                })
+        })
+        .collect();
+    data.sort_by_key(|name| name.addr);
+    for (index, name) in data.iter().enumerate() {
+        let end = name
+            .addr
+            .checked_add(name.size)
+            .context("data size overflows address space")?;
+        let section = sections
+            .iter()
+            .find(|section| section.contains(name.addr))
+            .unwrap();
+        ensure!(
+            end <= section.end,
+            "data symbol {} at {:#x} extends beyond section {:#x}",
+            name.name,
+            name.addr,
+            section.end
+        );
+        if let Some(next) = data.get(index + 1) {
+            ensure!(
+                end <= next.addr,
+                "data symbols {} at {:#x} and {} at {:#x} overlap",
+                name.name,
+                name.addr,
+                next.name,
+                next.addr
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Load and decode an exported `*.delink.json` file.
 pub fn load(path: &Path) -> Result<IdaModel> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let raw: RawModel =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
 
-    let sections = raw
+    let sections: Vec<Section> = raw
         .segments
         .into_iter()
         .map(|s| Section {
@@ -311,31 +377,64 @@ pub fn load(path: &Path) -> Result<IdaModel> {
         })
         .collect();
 
-    let functions = raw
+    let functions: Vec<Function> = raw
         .functions
         .into_iter()
-        .map(|f| Function {
-            start: f.start,
-            end: f.end,
-            name: f.name,
-            thunk: f.thunk,
-            lib: f.lib,
-            is_static: f.is_static,
-            public: f.public,
+        .map(|f| {
+            let end = match (f.size.as_ref(), f.end) {
+                (Some(size), None) => f
+                    .start
+                    .checked_add(parse_size(size)?)
+                    .context("function size overflows address space")?,
+                (None, Some(end)) => end,
+                _ => anyhow::bail!("function {} needs exactly one of size or end", f.name),
+            };
+            anyhow::ensure!(end > f.start, "function {} has invalid size", f.name);
+            Ok(Function {
+                start: f.start,
+                end,
+                name: f.name,
+                thunk: f.thunk,
+                lib: f.lib,
+                is_static: f.is_static,
+                public: f.public,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
-    let names = raw
+    let names: Vec<Name> = raw
         .names
         .into_iter()
-        .map(|n| Name {
-            addr: n.addr,
-            name: n.name,
-            public: n.public,
-            weak: n.weak,
-            is_func: n.is_func,
+        .map(|n| {
+            let size = n.size.as_ref().map(parse_size).transpose()?.unwrap_or(0);
+            if n.size.is_some()
+                && !n.is_func
+                && sections.iter().any(|section| {
+                    section.contains(n.addr)
+                        && matches!(
+                            section.class,
+                            SegClass::Data | SegClass::Const | SegClass::Bss
+                        )
+                })
+            {
+                ensure!(
+                    size > 0,
+                    "data symbol {} at {:#x} has zero size",
+                    n.name,
+                    n.addr
+                );
+            }
+            Ok(Name {
+                addr: n.addr,
+                size,
+                name: n.name,
+                public: n.public,
+                weak: n.weak,
+                is_func: n.is_func,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
+    validate_data_symbols(&sections, &names)?;
 
     let relocations = raw
         .relocations
@@ -452,4 +551,56 @@ pub fn combined_relocations(model: &IdaModel, pe: &PeImage) -> Vec<Reloc> {
     }
 
     by_addr.into_values().collect()
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    fn section() -> Section {
+        Section {
+            name: ".rdata".into(),
+            start: 0x1000,
+            end: 0x1100,
+            read: true,
+            write: false,
+            exec: false,
+            class: SegClass::Const,
+        }
+    }
+
+    fn name(addr: u64, size: u64, text: &str) -> Name {
+        Name {
+            addr,
+            size,
+            name: text.into(),
+            public: false,
+            weak: false,
+            is_func: false,
+        }
+    }
+
+    #[test]
+    fn parses_hexadecimal_sizes() {
+        assert_eq!(parse_size(&serde_json::json!("0xC")).unwrap(), 12);
+        assert_eq!(parse_size(&serde_json::json!("0x10")).unwrap(), 16);
+        assert!(parse_size(&serde_json::json!("12")).is_err());
+    }
+
+    #[test]
+    fn rejects_overlapping_data_symbols() {
+        let sections = [section()];
+        let names = [name(0x1004, 12, "kZero"), name(0x1008, 4, "dword")];
+        let error = validate_data_symbols(&sections, &names).unwrap_err();
+        assert!(error.to_string().contains("overlap"));
+        let names = [name(0x1004, 12, "kZero"), name(0x1010, 4, "next")];
+        validate_data_symbols(&sections, &names).unwrap();
+    }
+
+    #[test]
+    fn rejects_data_that_extends_past_section() {
+        let error =
+            validate_data_symbols(&[section()], &[name(0x10fc, 8, "past_end")]).unwrap_err();
+        assert!(error.to_string().contains("beyond section"));
+    }
 }

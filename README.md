@@ -22,8 +22,9 @@ has to link against IDA:
 
 1. **Export** (inside IDA 9.x). Run [`crates/delink-ida/ida_export.py`](crates/delink-ida/ida_export.py)
    to write a small, human-readable JSON describing the architecture/segment
-   layout, every function (boundaries + flags), switch-table ownership and
-   bounds, the full address → name map, and the relocations IDA knows (its
+   layout, every function (start + hexadecimal byte size + flags), switch-table ownership and
+   bounds, the full address → name map with editable hexadecimal data-symbol
+   sizes, and the relocations IDA knows (its
    fixup table **and** offset-typed operands —
    the latter being the only relocation record for images with no `.reloc`,
    e.g. EXEs). Unnamed data targets referenced by those relocations receive
@@ -33,6 +34,12 @@ has to link against IDA:
    Emitted objects also carry objdiff-compatible `.note.split` metadata so
    symbols can be displayed with their original virtual addresses. The export
    carries **no bytes**:
+
+   A data symbol's `size` can be expanded after removing any interior symbols
+   from `names`. References to those removed addresses then resolve as offsets
+   into the expanded symbol (for example `kZero+0x4`). Overlapping data symbols
+   are rejected. Older exports with function `end` addresses and no data sizes
+   remain readable.
 
    ```shell
    # headless (idat64.exe for a 64-bit database)

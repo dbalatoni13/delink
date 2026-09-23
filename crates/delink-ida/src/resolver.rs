@@ -27,6 +27,7 @@ struct FnInfo {
 pub struct Variable {
     pub name: String,
     pub public: bool,
+    pub size: u64,
 }
 
 pub struct IdaSymbols {
@@ -94,6 +95,7 @@ impl IdaSymbols {
                     Variable {
                         name: n.name.clone(),
                         public: n.public,
+                        size: n.size,
                     },
                 );
             }
@@ -135,13 +137,21 @@ impl IdaSymbols {
     /// data target remains renameable even when its containing range belongs
     /// to a different object.
     pub fn resolve_exact(&self, va: u64) -> Option<(String, i64)> {
-        self.names.get(&va).cloned().map(|name| (name, 0))
+        if let Some(name) = self.names.get(&va) {
+            return Some((name.clone(), 0));
+        }
+        self.variables
+            .range(..=va)
+            .next_back()
+            .and_then(|(start, variable)| {
+                (va - start < variable.size).then(|| (variable.name.clone(), (va - start) as i64))
+            })
     }
 
     /// Resolve a data reference → `(symbol, addend)`.
     pub fn resolve_data(&self, va: u64) -> Option<(String, i64)> {
-        if let Some(name) = self.names.get(&va) {
-            return Some((name.clone(), 0));
+        if let Some(named) = self.resolve_exact(va) {
+            return Some(named);
         }
         if let Some((start, info)) = self.funcs.range(..=va).next_back() {
             if va < info.end {
@@ -185,4 +195,47 @@ impl delink_x86_64::recover::SymbolResolver for IdaSymbols {
     // format-generic path (COFF/ELF × x86/x86-64) can't represent it. The
     // defaults (u64::MAX / false) keep the recovery pass from emitting relocs
     // this emit would drop. See delink-pe for the PE-side implementation.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IdaArch, Name, Section};
+
+    #[test]
+    fn resolves_removed_interior_labels_as_data_addends() {
+        let model = IdaModel {
+            arch: IdaArch::X86,
+            procname: "metapc".into(),
+            bits: 32,
+            little_endian: true,
+            image_base: 0x1000,
+            filetype: "PE".into(),
+            input_file: "test.exe".into(),
+            sections: vec![Section {
+                name: ".rdata".into(),
+                start: 0x2000,
+                end: 0x2100,
+                read: true,
+                write: false,
+                exec: false,
+                class: SegClass::Const,
+            }],
+            functions: vec![],
+            names: vec![Name {
+                addr: 0x2004,
+                size: 12,
+                name: "kZero".into(),
+                public: true,
+                weak: false,
+                is_func: false,
+            }],
+            relocations: vec![],
+            jump_tables: vec![],
+        };
+        let symbols = IdaSymbols::build(&model, &[]);
+        assert_eq!(symbols.resolve_data(0x2008), Some(("kZero".into(), 4)));
+        assert_eq!(symbols.resolve_exact(0x200c), Some(("kZero".into(), 8)));
+        assert_eq!(symbols.resolve_exact(0x2010), None);
+    }
 }

@@ -322,7 +322,7 @@ fn emit_shared_excluding(
                 let id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&var.name),
                     value: va - fragment.start,
-                    size: 0,
+                    size: var.size,
                     kind: SymbolKind::Data,
                     scope,
                     weak: false,
@@ -826,7 +826,7 @@ fn emit_object(
                 let id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&variable.name),
                     value: va - range.start,
-                    size: 0,
+                    size: variable.size,
                     kind: SymbolKind::Data,
                     scope,
                     weak: false,
@@ -2048,6 +2048,7 @@ mod tests {
         let (mut model, _, _) = test_model();
         model.names.push(crate::Name {
             addr: 0x1208,
+            size: 4,
             name: "renamable_data".into(),
             public: false,
             weak: false,
