@@ -459,14 +459,18 @@ def export_relocations():
     return out
 
 
-def _dtype_size(dtype, default):
-    try:
-        sz = ida_ua.get_dtype_size(dtype)
-        if sz in (1, 2, 4, 8):
-            return sz
-    except Exception:
-        pass
-    return default
+def _encoded_field_size(insn, op):
+    """Width of this operand's encoded field, not its value's data type.
+
+    For example, `mov dword ptr [eax+3Ch], offset name` has a one-byte
+    displacement followed by a four-byte immediate. Both operands have a
+    dword *data type*, but only the immediate can hold an OFF32 relocation.
+    """
+    next_field = min(
+        (other.offb for other in insn.ops if op.offb < other.offb < insn.size),
+        default=insn.size,
+    )
+    return next_field - op.offb
 
 
 def export_offset_relocations(ptr_size):
@@ -502,33 +506,35 @@ def export_offset_relocations(ptr_size):
                             continue  # no locatable encoded field
 
                         is_offset = offsets[n]
+                        field = ea + op.offb
+                        field_size = _encoded_field_size(insn, op)
                         is_abs_memory = (
                             ptr_size == 4
                             and op.type in (ida_ua.o_mem, ida_ua.o_displ)
                             and bool(data_refs)
+                            and field_size == 4
                         )
-                        if not is_offset and not is_abs_memory:
+                        if (not is_offset and not is_abs_memory) or field_size not in (4, 8):
                             continue
 
-                        field = ea + op.offb
                         if is_abs_memory and not is_offset:
-                            # op.addr is normally the base VA. Use the xref as a
-                            # fallback for processor-module variants that store
-                            # only the displacement in the operand structure.
+                            # An instruction's data xrefs also include other
+                            # operands. Require the encoded displacement (or
+                            # IDA's decoded address) to name this xref.
                             operand_target = int(op.addr)
+                            encoded_target = int(ida_bytes.get_dword(field))
                             if operand_target in data_refs:
                                 target = operand_target
-                            elif len(data_refs) == 1:
-                                target = next(iter(data_refs))
+                            elif encoded_target in data_refs:
+                                target = encoded_target
                             else:
-                                continue  # ambiguous: do not guess a target
+                                continue
                             size = 4
                         else:
-                            size = _dtype_size(op.dtype, ptr_size)
+                            size = field_size
                             if size == 8:
                                 target = int(ida_bytes.get_qword(field))
                             else:
-                                size = 4
                                 target = int(ida_bytes.get_dword(field))
 
                         out.append(
