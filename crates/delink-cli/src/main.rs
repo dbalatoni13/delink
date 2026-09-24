@@ -222,6 +222,17 @@ enum Cmd {
         #[arg(long, conflicts_with = "elf")]
         coff: bool,
     },
+
+    /// Restore PE headers and untouched sections around relinked IDA sections.
+    IdaRestorePe {
+        /// Original PE providing headers, resources, and other untouched sections.
+        original: PathBuf,
+        /// PE produced by linking the split COFF objects.
+        relinked: PathBuf,
+        /// Path for the restored PE.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -302,6 +313,11 @@ fn main() -> Result<()> {
             elf,
             coff,
         } => cmd_ida_split(&json, &binary, &outdir, idapro.as_deref(), elf, coff),
+        Cmd::IdaRestorePe {
+            original,
+            relinked,
+            output,
+        } => cmd_ida_restore_pe(&original, &relinked, &output),
     }
 }
 
@@ -1319,6 +1335,166 @@ fn cmd_ida_inspect(json: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cmd_ida_restore_pe(original: &Path, relinked: &Path, output: &Path) -> Result<()> {
+    use object::{BinaryFormat, Object as _, ObjectSection as _};
+
+    let original_bytes = std::fs::read(original)
+        .with_context(|| format!("read original PE {}", original.display()))?;
+    let relinked_bytes = std::fs::read(relinked)
+        .with_context(|| format!("read relinked PE {}", relinked.display()))?;
+    let original_pe = object::File::parse(original_bytes.as_slice())?;
+    let relinked_pe = object::File::parse(relinked_bytes.as_slice())?;
+    if original_pe.format() != BinaryFormat::Pe || relinked_pe.format() != BinaryFormat::Pe {
+        return Err(anyhow!("both inputs must be PE files"));
+    }
+    for required in [".text", ".rdata", ".data", ".rsrc"] {
+        if original_pe.section_by_name(required).is_some()
+            && relinked_pe.section_by_name(required).is_none()
+        {
+            return Err(anyhow!("relinked PE has no {required} section"));
+        }
+    }
+
+    let mut restored = original_bytes.clone();
+    for linked_section in relinked_pe.sections() {
+        let name = linked_section.name()?;
+        let original_section = original_pe
+            .section_by_name(name)
+            .ok_or_else(|| anyhow!("unexpected relinked section {name}"))?;
+        if original_section.address() != linked_section.address()
+            || if name == ".rsrc" {
+                linked_section.size() > original_section.size()
+            } else {
+                original_section.size() != linked_section.size()
+            }
+        {
+            return Err(anyhow!(
+                "{name} address or virtual size differs from the original"
+            ));
+        }
+        let (original_offset, original_len) = original_section
+            .file_range()
+            .ok_or_else(|| anyhow!("original {name} has no file data"))?;
+        let (linked_offset, linked_len) = linked_section
+            .file_range()
+            .ok_or_else(|| anyhow!("relinked {name} has no file data"))?;
+        if if name == ".rsrc" {
+            linked_len > original_len
+        } else {
+            original_len != linked_len
+        } {
+            return Err(anyhow!(
+                "{name} raw size differs: original {original_len:#x}, linked {linked_len:#x}"
+            ));
+        }
+        let original_start = usize::try_from(original_offset)?;
+        let linked_start = usize::try_from(linked_offset)?;
+        // The original may contain unreferenced bytes after the last resource
+        // payload. The `.res` link rebuilds the directory and payloads; retain
+        // only that unrelated tail from the original image.
+        let len = usize::try_from(if name == ".rsrc" {
+            linked_section.size()
+        } else {
+            original_len
+        })?;
+        let original_end = original_start
+            .checked_add(len)
+            .context("PE offset overflow")?;
+        let linked_end = linked_start
+            .checked_add(len)
+            .context("PE offset overflow")?;
+        let source = relinked_bytes
+            .get(linked_start..linked_end)
+            .ok_or_else(|| anyhow!("relinked {name} extends past end of file"))?;
+        restored
+            .get_mut(original_start..original_end)
+            .ok_or_else(|| anyhow!("original {name} extends past end of file"))?
+            .copy_from_slice(source);
+    }
+    if let Ok(output_path) = output.canonicalize() {
+        if output_path == original.canonicalize()? || output_path == relinked.canonicalize()? {
+            return Err(anyhow!("output must be separate from both input files"));
+        }
+    }
+    std::fs::write(output, restored).with_context(|| format!("write {}", output.display()))?;
+    Ok(())
+}
+
+fn normalize_ida_link_names(model: &mut delink_ida::IdaModel) -> usize {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut locations: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for function in &model.functions {
+        locations
+            .entry(function.name.clone())
+            .or_default()
+            .insert(function.start);
+    }
+    for name in &model.names {
+        locations
+            .entry(name.name.clone())
+            .or_default()
+            .insert(name.addr);
+    }
+    let mut renamed = BTreeMap::new();
+    for (name, addresses) in locations {
+        if addresses.len() < 2 {
+            continue;
+        }
+        let keep = addresses
+            .iter()
+            .find(|&&address| {
+                model
+                    .section_for(address)
+                    .is_some_and(|section| section.class == delink_ida::SegClass::Xtrn)
+            })
+            .copied()
+            .unwrap_or(*addresses.first().unwrap());
+        for address in addresses {
+            if address != keep {
+                renamed.insert(
+                    (name.clone(), address),
+                    format!("{name}__delink_{address:08X}"),
+                );
+            }
+        }
+    }
+    for function in &mut model.functions {
+        if let Some(name) = renamed.get(&(function.name.clone(), function.start)) {
+            function.name = name.clone();
+        }
+    }
+    for name in &mut model.names {
+        if let Some(replacement) = renamed.get(&(name.name.clone(), name.addr)) {
+            name.name = replacement.clone();
+        }
+        if name.name.starts_with("__IMPORT_DESCRIPTOR_") {
+            name.name = format!("__delink_original_{}", name.name);
+        }
+    }
+    // MSVC's x86 linker decorates /ENTRY:entry as _entry. Keep both spellings
+    // at the same address so old and current linkers select the real function.
+    if model.arch == delink_ida::IdaArch::X86 {
+        if let Some(entry) = model
+            .functions
+            .iter()
+            .find(|function| function.name == "entry")
+        {
+            if !model.names.iter().any(|name| name.name == "_entry") {
+                model.names.push(delink_ida::Name {
+                    addr: entry.start,
+                    size: 0,
+                    name: "_entry".into(),
+                    public: true,
+                    weak: false,
+                    is_func: true,
+                });
+            }
+        }
+    }
+    renamed.len()
+}
+
 fn cmd_ida_split(
     json: &Path,
     binary: &Path,
@@ -1329,8 +1505,19 @@ fn cmd_ida_split(
 ) -> Result<()> {
     use delink_ida::emit::OutputFormat;
 
-    let model = delink_ida::load(json)?;
+    let mut model = delink_ida::load(json)?;
     let pe = delink_ida::load_binary(binary)?;
+    let format = if elf {
+        OutputFormat::Elf
+    } else if coff {
+        OutputFormat::Coff
+    } else {
+        OutputFormat::default_for_filetype(&model.filetype)
+    };
+    if format == OutputFormat::Coff {
+        let renamed = normalize_ida_link_names(&mut model);
+        tracing::info!("ida-split: renamed {renamed} colliding COFF names");
+    }
     let relocs = delink_ida::combined_relocations(&model, &pe);
     let symbols = delink_ida::IdaSymbols::build(&model, &relocs);
     tracing::info!(
@@ -1340,13 +1527,6 @@ fn cmd_ida_split(
         pe.base_relocations.len(),
     );
 
-    let format = if elf {
-        OutputFormat::Elf
-    } else if coff {
-        OutputFormat::Coff
-    } else {
-        OutputFormat::default_for_filetype(&model.filetype)
-    };
     tracing::info!(
         "ida-split: arch={:?} format={:?} ({} functions)",
         model.arch,
@@ -1373,18 +1553,48 @@ fn cmd_ida_split(
     .with_context(|| format!("write {}", idapro_out.display()))?;
     tracing::info!("idapro → {}", idapro_out.display());
 
-    let outcomes =
-        delink_ida::emit::split_by_groups(&model, &pe, &symbols, &groups, outdir, format)?;
-
     let shared_ext = if matches!(format, OutputFormat::Elf) {
         "o"
     } else {
         "obj"
     };
     let shared = outdir.join(format!("__shared_data.{shared_ext}"));
-    tracing::info!("emitting shared data → {}", shared.display());
     let shared_stats =
         delink_ida::emit::emit_shared_for_groups(&model, &pe, &symbols, &groups, &shared, format)?;
+    let shared_empty = shared_stats.text_bytes == 0
+        && shared_stats.data_bytes == 0
+        && shared_stats.const_bytes == 0
+        && shared_stats.bss_bytes == 0
+        && shared_stats.relocations == 0;
+    if shared_empty {
+        std::fs::remove_file(&shared)
+            .with_context(|| format!("remove empty {}", shared.display()))?;
+    } else {
+        tracing::info!("emitted unassigned bytes → {}", shared.display());
+    }
+    let outcomes =
+        delink_ida::emit::split_by_groups(&model, &pe, &symbols, &groups, outdir, format)?;
+    if model.filetype == "PE" {
+        let auxiliary = outdir.join("__pe_resources.res");
+        let count = delink_ida::emit::emit_pe_resources(&model, &pe, &auxiliary)?;
+        if count != 0 {
+            tracing::info!(
+                "ida-split: emitted {count} original PE resource records → {}",
+                auxiliary.display()
+            );
+        }
+    }
+    if format == OutputFormat::Coff
+        && model.arch == delink_ida::IdaArch::X86
+        && model.filetype.eq_ignore_ascii_case("PE")
+    {
+        let auxiliary = outdir.join("__except_list.obj");
+        delink_ida::emit::emit_except_list_symbol(&auxiliary)?;
+        tracing::info!(
+            "ida-split: emitted absolute __except_list symbol → {}",
+            auxiliary.display()
+        );
+    }
 
     // Summary.
     let mut total = delink_ida::emit::EmitStats::default();

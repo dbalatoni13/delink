@@ -77,10 +77,11 @@ impl IdaSymbols {
         let data_range = section_range(&|c| c == SegClass::Data);
         let const_range = section_range(&|c| c == SegClass::Const);
         let bss_range = section_range(&|c| c == SegClass::Bss);
+        let xtrn_range = section_range(&|c| c == SegClass::Xtrn);
 
         // Named variables: names that are not functions and live in a data section.
         let in_data = |va: u64| {
-            [&data_range, &const_range, &bss_range]
+            [&data_range, &const_range, &bss_range, &xtrn_range]
                 .iter()
                 .any(|r| r.as_ref().is_some_and(|r| r.contains(&va)))
         };

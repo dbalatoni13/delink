@@ -40,6 +40,23 @@ fn read_padded(pe: &PeImage, rva: u64, len: usize) -> Vec<u8> {
     out
 }
 
+fn original_virtual_end(pe: &PeImage, model: &IdaModel, start: u64, fallback: u64) -> u64 {
+    pe.section_for_rva(start - model.image_base)
+        .map(|section| fallback.min(section.va + section.virtual_size))
+        .unwrap_or(fallback)
+}
+
+fn original_initialized_end(pe: &PeImage, model: &IdaModel, start: u64) -> Option<u64> {
+    pe.section_for_rva(start - model.image_base).map(|section| {
+        section.va
+            + section
+                .data
+                .iter()
+                .rposition(|&byte| byte != 0)
+                .map_or(0, |offset| offset as u64 + 1)
+    })
+}
+
 /// REL32 fields are next-instruction-relative; the object writer (and the ELF
 /// S+A−P convention) reference the field start, so subtract the 4-byte field
 /// width from the recovered addend (same adjustment as the PE/Mach-O emitters).
@@ -90,6 +107,7 @@ pub struct EmitStats {
 
 #[derive(Debug, Default)]
 pub struct SharedDataStats {
+    pub text_bytes: u64,
     pub data_bytes: u64,
     pub const_bytes: u64,
     pub bss_bytes: u64,
@@ -101,6 +119,192 @@ pub struct CuOutcome {
     pub cu_name: String,
     pub file: std::path::PathBuf,
     pub result: std::result::Result<EmitStats, String>,
+}
+
+#[derive(Clone)]
+enum ResourceId {
+    Number(u16),
+    Text(Vec<u16>),
+}
+
+fn resource_word(bytes: &[u8], offset: usize) -> Result<u16> {
+    Ok(u16::from_le_bytes(
+        bytes
+            .get(offset..offset + 2)
+            .ok_or_else(|| anyhow!("resource record is out of bounds"))?
+            .try_into()?,
+    ))
+}
+
+fn resource_dword(bytes: &[u8], offset: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow!("resource record is out of bounds"))?
+            .try_into()?,
+    ))
+}
+
+fn resource_identifier(bytes: &[u8], value: u32) -> Result<ResourceId> {
+    if value & 0x8000_0000 == 0 {
+        return Ok(ResourceId::Number(value as u16));
+    }
+    let offset = (value & 0x7fff_ffff) as usize;
+    let length = resource_word(bytes, offset)? as usize;
+    let mut text = Vec::with_capacity(length);
+    for index in 0..length {
+        text.push(resource_word(bytes, offset + 2 + index * 2)?);
+    }
+    Ok(ResourceId::Text(text))
+}
+
+fn append_resource_identifier(out: &mut Vec<u8>, id: &ResourceId) {
+    match id {
+        ResourceId::Number(number) => {
+            out.extend_from_slice(&0xffffu16.to_le_bytes());
+            out.extend_from_slice(&number.to_le_bytes());
+        }
+        ResourceId::Text(text) => {
+            for character in text {
+                out.extend_from_slice(&character.to_le_bytes());
+            }
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
+}
+
+fn append_res_record(
+    out: &mut Vec<u8>,
+    kind: &ResourceId,
+    name: &ResourceId,
+    language: u16,
+    data: &[u8],
+) -> Result<()> {
+    let start = out.len();
+    out.extend_from_slice(&u32::try_from(data.len())?.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    append_resource_identifier(out, kind);
+    append_resource_identifier(out, name);
+    while (out.len() - start) % 4 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(&0u32.to_le_bytes()); // data version
+    out.extend_from_slice(&0u16.to_le_bytes()); // memory flags
+    out.extend_from_slice(&language.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // version
+    out.extend_from_slice(&0u32.to_le_bytes()); // characteristics
+    let header_size = u32::try_from(out.len() - start)?;
+    out[start + 4..start + 8].copy_from_slice(&header_size.to_le_bytes());
+    out.extend_from_slice(data);
+    while (out.len() - start) % 4 != 0 {
+        out.push(0);
+    }
+    Ok(())
+}
+
+/// Extract PE resources into a standard `.res` file that MSVC link.exe can
+/// embed. Resource payloads are emitted in original RVA order.
+pub fn emit_pe_resources(model: &IdaModel, pe: &PeImage, out_path: &Path) -> Result<usize> {
+    let Some(section) = pe.sections.iter().find(|section| section.name == ".rsrc") else {
+        return Ok(0);
+    };
+    if model
+        .sections
+        .iter()
+        .any(|mapped| mapped.start <= section.va && section.va < mapped.end)
+    {
+        return Ok(0);
+    }
+    let bytes = &section.data;
+    let mut records: Vec<(u32, ResourceId, ResourceId, u16, Vec<u8>)> = Vec::new();
+    fn visit(
+        pe: &PeImage,
+        bytes: &[u8],
+        offset: usize,
+        depth: usize,
+        ids: &mut Vec<ResourceId>,
+        records: &mut Vec<(u32, ResourceId, ResourceId, u16, Vec<u8>)>,
+    ) -> Result<()> {
+        if depth > 2 {
+            return Err(anyhow!("PE resource tree is deeper than three levels"));
+        }
+        let count = resource_word(bytes, offset + 12)? as usize
+            + resource_word(bytes, offset + 14)? as usize;
+        for index in 0..count {
+            let entry = offset + 16 + index * 8;
+            let id = resource_identifier(bytes, resource_dword(bytes, entry)?)?;
+            let child = resource_dword(bytes, entry + 4)?;
+            if depth < 2 {
+                if child & 0x8000_0000 == 0 {
+                    return Err(anyhow!("PE resource directory ends early"));
+                }
+                ids.push(id);
+                visit(
+                    pe,
+                    bytes,
+                    (child & 0x7fff_ffff) as usize,
+                    depth + 1,
+                    ids,
+                    records,
+                )?;
+                ids.pop();
+            } else {
+                if child & 0x8000_0000 != 0 {
+                    return Err(anyhow!("PE resource leaf is a directory"));
+                }
+                let data_entry = child as usize;
+                let rva = resource_dword(bytes, data_entry)?;
+                let size = resource_dword(bytes, data_entry + 4)? as usize;
+                let data = pe
+                    .data_at_rva(rva as u64, size)
+                    .ok_or_else(|| anyhow!("PE resource payload is out of bounds"))?;
+                let language = match id {
+                    ResourceId::Number(language) => language,
+                    ResourceId::Text(_) => return Err(anyhow!("named PE resource language")),
+                };
+                records.push((rva, ids[0].clone(), ids[1].clone(), language, data.to_vec()));
+            }
+        }
+        Ok(())
+    }
+    visit(pe, bytes, 0, 0, &mut Vec::new(), &mut records)?;
+    records.sort_by_key(|record| record.0);
+    let mut out = Vec::new();
+    append_res_record(
+        &mut out,
+        &ResourceId::Number(0),
+        &ResourceId::Number(0),
+        0,
+        &[],
+    )?;
+    for (_, kind, name, language, data) in &records {
+        append_res_record(&mut out, kind, name, *language, data)?;
+    }
+    write_file(out_path, &out)?;
+    Ok(records.len())
+}
+
+/// Emit the MSVC x86 absolute `__except_list = 0` symbol as a sectionless COFF
+/// object. `FS:[0]` references are represented as relocations to this symbol in
+/// split objects; defining it here lets link.exe resolve them without adding
+/// bytes or sections to the linked image.
+pub fn emit_except_list_symbol(out_path: &Path) -> Result<()> {
+    let mut obj = Object::new(BinaryFormat::Coff, Architecture::I386, Endianness::Little);
+    obj.set_mangling(Mangling::Coff);
+    obj.add_symbol(Symbol {
+        name: b"__except_list".to_vec(),
+        value: 0,
+        size: 0,
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Absolute,
+        flags: SymbolFlags::None,
+    });
+    write_file(
+        out_path,
+        &obj.write().context("serialize __except_list object")?,
+    )
 }
 
 #[derive(Debug)]
@@ -137,12 +341,28 @@ pub fn split_by_groups(
     // quadratic in the number of functions.
     let functions_by_start: HashMap<u64, &Function> =
         model.functions.iter().map(|f| (f.start, f)).collect();
+    let code_names: std::collections::BTreeMap<u64, Vec<&crate::Name>> = {
+        let mut names = std::collections::BTreeMap::new();
+        for name in &model.names {
+            names.entry(name.addr).or_insert_with(Vec::new).push(name);
+        }
+        names
+    };
 
     let groups = expand_function_ranges(model, groups)?;
     validate_data_ranges(model, &groups)?;
     let owned_ranges = owned_data_ranges(&groups);
 
-    let group_vec: Vec<(&String, &ObjectGroup)> = groups.iter().collect();
+    let group_vec: Vec<(&String, &ObjectGroup)> = groups
+        .iter()
+        .filter(|(_, group)| {
+            !group.functions.is_empty()
+                || !group.function_ranges.is_empty()
+                || !group.rdata.is_empty()
+                || !group.data.is_empty()
+                || !group.bss.is_empty()
+        })
+        .collect();
     let outcomes = group_vec
         .par_iter()
         .map(|(file_name, group)| {
@@ -152,6 +372,7 @@ pub fn split_by_groups(
                 pe,
                 symbols,
                 &functions_by_start,
+                &code_names,
                 group,
                 &owned_ranges,
                 format,
@@ -176,7 +397,17 @@ pub fn emit_shared(
     out_path: &Path,
     format: OutputFormat,
 ) -> Result<SharedDataStats> {
-    emit_shared_excluding(model, pe, symbols, &[], &[], out_path, format)
+    emit_shared_excluding(
+        model,
+        pe,
+        symbols,
+        &[],
+        &[],
+        &[],
+        &HashSet::new(),
+        out_path,
+        format,
+    )
 }
 
 /// Emit data not assigned to an object in `idapro.json` into `__shared_data`.
@@ -188,11 +419,20 @@ pub fn emit_shared_for_groups(
     out_path: &Path,
     format: OutputFormat,
 ) -> Result<SharedDataStats> {
-    validate_data_ranges(model, groups)?;
-    let owned_ranges = owned_data_ranges(groups);
+    let groups = expand_function_ranges(model, groups)?;
+    validate_data_ranges(model, &groups)?;
+    let owned_ranges = owned_data_ranges(&groups);
+    let emitted_functions: HashSet<u64> = groups
+        .values()
+        .flat_map(|group| group.functions.iter().copied())
+        .collect();
     let excluded: Vec<Range<u64>> = owned_ranges
         .iter()
         .map(|owned| owned.range.clone())
+        .collect();
+    let owned_code_ranges: Vec<Range<u64>> = groups
+        .values()
+        .flat_map(|group| group.function_ranges.iter().map(|range| range.range()))
         .collect();
     emit_shared_excluding(
         model,
@@ -200,6 +440,8 @@ pub fn emit_shared_for_groups(
         symbols,
         &excluded,
         &owned_ranges,
+        &owned_code_ranges,
+        &emitted_functions,
         out_path,
         format,
     )
@@ -211,6 +453,8 @@ fn emit_shared_excluding(
     symbols: &IdaSymbols,
     excluded: &[Range<u64>],
     owned_ranges: &[OwnedDataRange],
+    owned_code_ranges: &[Range<u64>],
+    emitted_functions: &HashSet<u64>,
     out_path: &Path,
     format: OutputFormat,
 ) -> Result<SharedDataStats> {
@@ -235,6 +479,111 @@ fn emit_shared_excluding(
     }
     let mut pending: Vec<PendingData> = Vec::new();
 
+    // Functions are emitted separately, but linked images also contain code
+    // labels and initialized data between functions (notably x86 SEH tables).
+    // Emit only those gaps and define their names at offsets in the compact
+    // contribution. Reserving the full code section would duplicate every
+    // function in the linked image.
+    if !emitted_functions.is_empty() {
+        for sec in model
+            .sections
+            .iter()
+            .filter(|sec| sec.class == SegClass::Code)
+        {
+            let code_end = original_virtual_end(pe, model, sec.start, sec.end);
+            let mut emitted_table_names = HashSet::new();
+            let mut occupied = Vec::new();
+            occupied.extend(owned_code_ranges.iter().cloned());
+            for f in model
+                .functions
+                .iter()
+                .filter(|f| emitted_functions.contains(&f.start) && sec.contains(f.start))
+            {
+                let mut tables: Vec<JumpTable> = model
+                    .jump_tables
+                    .iter()
+                    .filter(|table| table.owner == f.start)
+                    .cloned()
+                    .collect();
+                if tables.is_empty() && model.arch == IdaArch::X86 {
+                    if let Some(original) =
+                        pe.data_at_rva(f.start - model.image_base, f.size() as usize)
+                    {
+                        tables = discover_x86_jump_tables(original, f.start, f.end, model, pe);
+                    }
+                }
+                let end = tables.iter().fold(f.end, |end, table| {
+                    emitted_table_names.insert(table.name.clone());
+                    end.max(table.end())
+                });
+                occupied.push(f.start..end.min(sec.end));
+            }
+            let gap_names: std::collections::BTreeMap<u64, Vec<&crate::Name>> = {
+                let mut names = std::collections::BTreeMap::new();
+                for name in model.names.iter().filter(|name| sec.contains(name.addr)) {
+                    names.entry(name.addr).or_insert_with(Vec::new).push(name);
+                }
+                names
+            };
+            for gap in subtract_ranges(sec.start..code_end, &occupied) {
+                let sid = obj.add_section(
+                    Vec::new(),
+                    text_name(format).as_bytes().to_vec(),
+                    SectionKind::Text,
+                );
+                let mut bytes = read_padded(
+                    pe,
+                    gap.start - model.image_base,
+                    (gap.end - gap.start) as usize,
+                );
+                let base = obj.section(sid).data().len() as u64;
+                for reloc in symbols.relocs_in(gap.clone()) {
+                    let Some((name, addend)) =
+                        resolve_split_data(symbols, owned_ranges, reloc.target)
+                    else {
+                        continue;
+                    };
+                    if abs_flags(format, model.arch, reloc.size).is_none() {
+                        continue;
+                    }
+                    let offset = (reloc.addr - gap.start) as usize;
+                    let width = reloc.size as usize;
+                    if offset + width > bytes.len() {
+                        continue;
+                    }
+                    bytes[offset..offset + width].fill(0);
+                    pending.push(PendingData {
+                        sid,
+                        offset: base + offset as u64,
+                        name,
+                        addend,
+                        size: reloc.size,
+                    });
+                }
+                let base = obj.append_section_data(sid, &bytes, 1);
+                stats.text_bytes += gap.end - gap.start;
+                for (_, names) in gap_names.range(gap.clone()) {
+                    for name in names {
+                        if emitted_table_names.contains(&name.name) {
+                            continue;
+                        }
+                        let id = obj.add_symbol(Symbol {
+                            name: sanitize_symbol_name(&name.name),
+                            value: base + name.addr - gap.start,
+                            size: name.size,
+                            kind: SymbolKind::Data,
+                            scope: SymbolScope::Dynamic,
+                            weak: false,
+                            section: SymbolSection::Section(sid),
+                            flags: SymbolFlags::None,
+                        });
+                        defined.entry(name.name.clone()).or_insert(id);
+                    }
+                }
+            }
+        }
+    }
+
     for sec in &model.sections {
         let (kind, name, start_sym, bytes_field): (SectionKind, &str, &str, &mut u64) =
             match sec.class {
@@ -245,6 +594,12 @@ fn emit_shared_excluding(
                     &mut stats.data_bytes,
                 ),
                 SegClass::Const => (
+                    SectionKind::ReadOnlyData,
+                    const_name(format),
+                    SYM_CONST_START,
+                    &mut stats.const_bytes,
+                ),
+                SegClass::Xtrn => (
                     SectionKind::ReadOnlyData,
                     const_name(format),
                     SYM_CONST_START,
@@ -262,12 +617,26 @@ fn emit_shared_excluding(
         // All configured ranges are removed from the shared object. This is
         // important for logical `bss` ranges that originate in an IDA DATA
         // segment: their bytes must not remain in shared `.data`.
-        let fragments = subtract_ranges(sec.start..sec.end, excluded);
+        let section_end = original_virtual_end(pe, model, sec.start, sec.end);
+        let fragments = subtract_ranges(sec.start..section_end, excluded);
         for fragment in fragments {
-            let sid = obj.add_section(Vec::new(), name.as_bytes().to_vec(), kind);
+            let kind = if sec.class == SegClass::Data
+                && original_initialized_end(pe, model, fragment.start)
+                    .is_some_and(|end| fragment.start >= end)
+            {
+                SectionKind::UninitializedData
+            } else {
+                kind
+            };
+            let section_name = if kind == SectionKind::UninitializedData {
+                bss_name(format).to_string()
+            } else {
+                name.to_string()
+            };
+            let sid = obj.add_section(Vec::new(), section_name.into_bytes(), kind);
             let size = fragment.end - fragment.start;
             if kind == SectionKind::UninitializedData {
-                obj.section_mut(sid).append_bss(size, 16);
+                obj.section_mut(sid).append_bss(size, 1);
             } else {
                 let rva = fragment.start.wrapping_sub(model.image_base);
                 let mut bytes = read_padded(pe, rva, size as usize);
@@ -296,10 +665,12 @@ fn emit_shared_excluding(
                         });
                     }
                 }
-                obj.append_section_data(sid, &bytes, 16);
+                obj.append_section_data(sid, &bytes, 1);
             }
 
-            if is_first_class_address(model, sec.class, fragment.start) {
+            if sec.class != SegClass::Xtrn
+                && is_first_class_address(model, sec.class, fragment.start)
+            {
                 let id = obj.add_symbol(Symbol {
                     name: start_sym.as_bytes().to_vec(),
                     value: 0,
@@ -314,17 +685,12 @@ fn emit_shared_excluding(
             }
 
             for (va, var) in symbols.variables.range(fragment.clone()) {
-                let scope = if var.public {
-                    SymbolScope::Dynamic
-                } else {
-                    SymbolScope::Compilation
-                };
                 let id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&var.name),
                     value: va - fragment.start,
                     size: var.size,
                     kind: SymbolKind::Data,
-                    scope,
+                    scope: SymbolScope::Dynamic,
                     weak: false,
                     section: SymbolSection::Section(sid),
                     flags: SymbolFlags::None,
@@ -370,13 +736,14 @@ fn emit_object(
     pe: &PeImage,
     symbols: &IdaSymbols,
     functions_by_start: &HashMap<u64, &Function>,
+    code_names: &std::collections::BTreeMap<u64, Vec<&crate::Name>>,
     group: &ObjectGroup,
     owned_ranges: &[OwnedDataRange],
     format: OutputFormat,
     out_path: &Path,
 ) -> Result<EmitStats> {
     // `idapro.json` contains grouping only. Resolve every configured address
-    // through the authoritative delink model for name, bounds, and visibility.
+    // through the authoritative delink model for name and bounds.
     let mut seen = HashSet::new();
     let mut funcs = Vec::with_capacity(group.functions.len());
     for &address in &group.functions {
@@ -395,8 +762,13 @@ fn emit_object(
         funcs.push(*f);
     }
     funcs.sort_by_key(|f| f.start);
-    if funcs.is_empty() && group.rdata.is_empty() && group.data.is_empty() && group.bss.is_empty() {
-        return Err(anyhow!("group has no functions or data ranges"));
+    if funcs.is_empty()
+        && group.function_ranges.is_empty()
+        && group.rdata.is_empty()
+        && group.data.is_empty()
+        && group.bss.is_empty()
+    {
+        return Err(anyhow!("group has no code or data ranges"));
     }
 
     let (arch, endian) = obj_arch(model);
@@ -405,7 +777,6 @@ fn emit_object(
         obj.set_mangling(Mangling::Coff);
     }
     let text_name = text_name(format);
-    let sid = obj.add_section(Vec::new(), text_name.as_bytes().to_vec(), SectionKind::Text);
 
     let mut local: HashMap<String, SymbolId> = HashMap::new();
     let mut undef: HashMap<String, SymbolId> = HashMap::new();
@@ -424,10 +795,46 @@ fn emit_object(
     let mut pending: Vec<Pending> = Vec::new();
     let rel32 = rel32_flags(format, model.arch);
 
+    // Create code sections in address order. LINK keeps contributions with
+    // ordinary section names in their object and input order.
+    let mut code_sections = HashMap::new();
+    let mut code_gaps = Vec::new();
+    let mut gap_table_names = HashSet::new();
+    let mut occupied = Vec::new();
+    for f in &funcs {
+        let mut tables: Vec<JumpTable> = model
+            .jump_tables
+            .iter()
+            .filter(|table| table.owner == f.start)
+            .cloned()
+            .collect();
+        if tables.is_empty() && model.arch == IdaArch::X86 {
+            if let Some(original) = pe.data_at_rva(f.start - model.image_base, f.size() as usize) {
+                tables = discover_x86_jump_tables(original, f.start, f.end, model, pe);
+            }
+        }
+        let end = tables.iter().fold(f.end, |end, table| {
+            gap_table_names.insert(table.name.clone());
+            end.max(table.end())
+        });
+        occupied.push(f.start..end);
+    }
+    for configured in &group.function_ranges {
+        code_gaps.extend(subtract_ranges(configured.range(), &occupied));
+    }
+    let mut starts: Vec<u64> = funcs.iter().map(|f| f.start).collect();
+    starts.extend(code_gaps.iter().map(|gap| gap.start));
+    starts.sort_unstable();
+    for start in starts {
+        let sid = obj.add_section(Vec::new(), text_name.as_bytes().to_vec(), SectionKind::Text);
+        code_sections.insert(start, sid);
+    }
+
     for f in &funcs {
         let name = &f.name;
         let start = f.start;
         let end = f.end;
+        let sid = code_sections[&start];
         let owner_section = model.section_for(start);
         let mut tables: Vec<JumpTable> = model
             .jump_tables
@@ -583,22 +990,42 @@ fn emit_object(
 
         let fn_off = obj.append_section_data(sid, &bytes, 1);
 
-        let scope = if f.public {
-            SymbolScope::Dynamic
-        } else {
-            SymbolScope::Compilation
-        };
         let sym_id = obj.add_symbol(Symbol {
             name: sanitize_symbol_name(name),
             value: fn_off,
             size,
             kind: SymbolKind::Text,
-            scope,
+            // IDA's "public" flag does not describe the visibility needed
+            // after splitting. A named function can be called by another
+            // emitted object even when IDA marks it non-public.
+            scope: SymbolScope::Dynamic,
             weak: false,
             section: SymbolSection::Section(sid),
             flags: SymbolFlags::None,
         });
         local.insert(name.clone(), sym_id);
+
+        // A code label inside a function may be the target of a relocation
+        // from another object. Its name must be defined at the original
+        // offset within this function's emitted bytes.
+        for (_, names) in code_names.range(start..emit_end) {
+            for label in names {
+                if label.name == *name {
+                    continue;
+                }
+                let id = obj.add_symbol(Symbol {
+                    name: sanitize_symbol_name(&label.name),
+                    value: fn_off + label.addr - start,
+                    size: 0,
+                    kind: SymbolKind::Data,
+                    scope: SymbolScope::Dynamic,
+                    weak: false,
+                    section: SymbolSection::Section(sid),
+                    flags: SymbolFlags::None,
+                });
+                local.entry(label.name.clone()).or_insert(id);
+            }
+        }
 
         // Switch tables live in .text but are data. Give the table and every
         // case destination first-class local symbols, then relocate the
@@ -720,6 +1147,60 @@ fn emit_object(
         }
     }
 
+    // Keep bytes between functions in the object that owns their configured
+    // code range. Source-compiled objects contain these bytes (often alignment
+    // padding) alongside the functions, so they must not go to __shared_data.
+    for gap in code_gaps {
+        let sid = code_sections[&gap.start];
+        let mut bytes = read_padded(
+            pe,
+            gap.start - model.image_base,
+            (gap.end - gap.start) as usize,
+        );
+        for reloc in symbols.relocs_in(gap.clone()) {
+            let Some(flags) = abs_flags(format, model.arch, reloc.size) else {
+                continue;
+            };
+            let Some((name, addend)) = resolve_split_data(symbols, owned_ranges, reloc.target)
+            else {
+                continue;
+            };
+            let offset = (reloc.addr - gap.start) as usize;
+            let width = reloc.size as usize;
+            if offset + width > bytes.len() {
+                continue;
+            }
+            bytes[offset..offset + width].fill(0);
+            pending.push(Pending {
+                sid,
+                offset: offset as u64,
+                sym: name,
+                addend,
+                flags,
+            });
+        }
+        obj.append_section_data(sid, &bytes, 1);
+        stats.text_bytes += gap.end - gap.start;
+        for (_, names) in code_names.range(gap.clone()) {
+            for label in names {
+                if gap_table_names.contains(&label.name) {
+                    continue;
+                }
+                let id = obj.add_symbol(Symbol {
+                    name: sanitize_symbol_name(&label.name),
+                    value: label.addr - gap.start,
+                    size: label.size,
+                    kind: SymbolKind::Data,
+                    scope: SymbolScope::Dynamic,
+                    weak: false,
+                    section: SymbolSection::Section(sid),
+                    flags: SymbolFlags::None,
+                });
+                local.entry(label.name.clone()).or_insert(id);
+            }
+        }
+    }
+
     // Emit the configured initialized-data contributions into this object.
     for (class, configured) in [
         (SegClass::Const, group.rdata.as_slice()),
@@ -727,31 +1208,50 @@ fn emit_object(
         (SegClass::Bss, group.bss.as_slice()),
     ] {
         for configured_range in configured {
-            let range = configured_range.range();
+            let mut range = configured_range.range();
             let _section = model
                 .sections
                 .iter()
                 .find(|section| {
                     (if class == SegClass::Bss {
                         matches!(section.class, SegClass::Bss | SegClass::Data)
+                    } else if class == SegClass::Const {
+                        matches!(section.class, SegClass::Const | SegClass::Xtrn)
                     } else {
                         section.class == class
                     }) && section.start <= range.start
                         && range.end <= section.end
                 })
                 .expect("data ranges were validated before emission");
+            range.end = original_virtual_end(pe, model, range.start, range.end);
+            if range.start >= range.end {
+                continue;
+            }
             let (kind, section_name) = match class {
                 SegClass::Const => (SectionKind::ReadOnlyData, const_name(format)),
                 SegClass::Data => (SectionKind::Data, data_name(format)),
                 SegClass::Bss => (SectionKind::UninitializedData, bss_name(format)),
                 _ => unreachable!("only data classes are emitted here"),
             };
-            let data_sid = obj.add_section(Vec::new(), section_name.as_bytes().to_vec(), kind);
+            let kind = if class == SegClass::Data
+                && original_initialized_end(pe, model, range.start)
+                    .is_some_and(|end| range.start >= end)
+            {
+                SectionKind::UninitializedData
+            } else {
+                kind
+            };
+            let section_name = if kind == SectionKind::UninitializedData {
+                bss_name(format).to_string()
+            } else {
+                section_name.to_string()
+            };
+            let data_sid = obj.add_section(Vec::new(), section_name.into_bytes(), kind);
             let size = range.end - range.start;
-            if class == SegClass::Bss {
+            if kind == SectionKind::UninitializedData {
                 // A logical BSS range is always zero-filled, even when IDA
                 // presents its virtual address range as part of `.data`.
-                obj.section_mut(data_sid).append_bss(size, 16);
+                obj.section_mut(data_sid).append_bss(size, 1);
             } else {
                 let rva = range.start.wrapping_sub(model.image_base);
                 let mut bytes = read_padded(pe, rva, size as usize);
@@ -818,17 +1318,12 @@ fn emit_object(
             }
 
             for (va, variable) in symbols.variables.range(range.clone()) {
-                let scope = if variable.public {
-                    SymbolScope::Dynamic
-                } else {
-                    SymbolScope::Compilation
-                };
                 let id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&variable.name),
                     value: va - range.start,
                     size: variable.size,
                     kind: SymbolKind::Data,
-                    scope,
+                    scope: SymbolScope::Dynamic,
                     weak: false,
                     section: SymbolSection::Section(data_sid),
                     flags: SymbolFlags::None,
@@ -916,11 +1411,12 @@ fn discover_x86_jump_tables(
     let section_end = model.section_for(start).map_or(end, |section| section.end);
     let next_function = model
         .functions
-        .iter()
-        .filter(|function| function.start > start)
-        .map(|function| function.start)
-        .min()
-        .unwrap_or(section_end)
+        .get(
+            model
+                .functions
+                .partition_point(|function| function.start <= start),
+        )
+        .map_or(section_end, |function| function.start)
         .min(section_end);
     let mut dispatches = Vec::new();
     let mut code_end = end;
@@ -1206,6 +1702,10 @@ fn validate_data_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<()> {
                         // output classification, not a requirement that the
                         // source segment already be named/classified BSS.
                         matches!(section.class, SegClass::Bss | SegClass::Data)
+                    } else if class == SegClass::Const {
+                        // IDA may label the import table at the start of the
+                        // PE read-only section as XTRN.
+                        matches!(section.class, SegClass::Const | SegClass::Xtrn)
                     } else {
                         section.class == class
                     }) && section.start <= range.start
@@ -1345,7 +1845,6 @@ fn expand_function_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<Idapr
                     ));
                 }
             }
-            let mut selected = 0usize;
             for function in functions.iter().skip(first) {
                 if function.start >= range.end {
                     break;
@@ -1369,14 +1868,6 @@ fn expand_function_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<Idapr
                     return Err(anyhow!("function address {:#x} {message}", function.start));
                 }
                 starts.push(function.start);
-                selected += 1;
-            }
-            if selected == 0 {
-                return Err(anyhow!(
-                    "idapro {file:?} function range [{:#x}, {:#x}) contains no functions",
-                    range.start,
-                    range.end
-                ));
             }
         }
 
@@ -1441,6 +1932,7 @@ fn text_name(fmt: OutputFormat) -> &'static str {
         OutputFormat::Elf => ".text",
     }
 }
+
 fn data_name(_fmt: OutputFormat) -> &'static str {
     ".data"
 }
@@ -1577,9 +2069,14 @@ fn split_meta_note(virtual_addresses: &[u64], is_64: bool) -> Result<Vec<u8>> {
 /// Attach objdiff/decomp-toolkit split metadata. The VIRT array is indexed by
 /// the raw object symbol-table index, including any COFF auxiliary-symbol gaps.
 fn write_object_with_split_meta(obj: &mut Object<'_>, model: &IdaModel) -> Result<Vec<u8>> {
-    // COFF has no native NOTE section kind. A discardable "other" section is
-    // ignored by normal linking/diffing, while objdiff recognizes it by name.
-    let note_sid = obj.add_section(Vec::new(), b".note.split".to_vec(), SectionKind::Other);
+    // The linker must remove this metadata from the final image. A COFF
+    // discardable data section is still copied into the PE by MSVC link.exe.
+    let kind = if obj.format() == BinaryFormat::Coff {
+        SectionKind::Linker
+    } else {
+        SectionKind::Other
+    };
+    let note_sid = obj.add_section(Vec::new(), b".note.split".to_vec(), kind);
     let provisional = obj.write().context("serialize object for split metadata")?;
     let file =
         object::File::parse(provisional.as_slice()).context("parse object for split metadata")?;
@@ -1621,6 +2118,200 @@ mod tests {
     use crate::idapro_json::DataRange;
     use delink_pe::{PeArch, PeSection};
     use object::ObjectSection as _;
+
+    #[test]
+    fn nonpublic_function_called_from_another_object_is_linkable() {
+        let mut code = vec![0x90; 0x20];
+        code[..5].copy_from_slice(&[0xe8, 0x0b, 0, 0, 0]); // call 0x401010
+        code[8] = 0xc3; // named code in the gap between functions
+        code[0x10] = 0xc3;
+        let model = IdaModel {
+            arch: IdaArch::X86,
+            procname: "metapc".into(),
+            bits: 32,
+            little_endian: true,
+            image_base: 0x400000,
+            filetype: "PE".into(),
+            input_file: "test.exe".into(),
+            sections: vec![
+                crate::Section {
+                    name: ".text".into(),
+                    start: 0x401000,
+                    end: 0x401020,
+                    read: true,
+                    write: false,
+                    exec: true,
+                    class: SegClass::Code,
+                },
+                crate::Section {
+                    name: ".idata".into(),
+                    start: 0x402000,
+                    end: 0x402004,
+                    read: true,
+                    write: false,
+                    exec: false,
+                    class: SegClass::Xtrn,
+                },
+            ],
+            functions: vec![
+                Function {
+                    start: 0x401000,
+                    end: 0x401005,
+                    name: "_main".into(),
+                    thunk: false,
+                    lib: false,
+                    is_static: false,
+                    public: true,
+                },
+                Function {
+                    start: 0x401010,
+                    end: 0x401011,
+                    name: "_helper".into(),
+                    thunk: false,
+                    lib: false,
+                    is_static: false,
+                    public: false,
+                },
+            ],
+            names: vec![
+                crate::Name {
+                    addr: 0x401008,
+                    size: 0,
+                    name: "handler".into(),
+                    public: false,
+                    weak: false,
+                    is_func: false,
+                },
+                crate::Name {
+                    addr: 0x402000,
+                    size: 4,
+                    name: "ImportedApi".into(),
+                    public: false,
+                    weak: false,
+                    is_func: false,
+                },
+            ],
+            relocations: vec![],
+            jump_tables: vec![],
+        };
+        let pe = PeImage {
+            arch: PeArch::X86,
+            image_base: model.image_base,
+            sections: vec![
+                PeSection {
+                    name: ".text".into(),
+                    rva: 0x1000,
+                    va: 0x401000,
+                    virtual_size: 0x20,
+                    data: code,
+                    characteristics: 0,
+                },
+                PeSection {
+                    name: ".rdata".into(),
+                    rva: 0x2000,
+                    va: 0x402000,
+                    virtual_size: 4,
+                    data: vec![1, 2, 3, 4],
+                    characteristics: 0,
+                },
+            ],
+            base_relocations: vec![],
+        };
+        let symbols = IdaSymbols::build(&model, &[]);
+        let groups = BTreeMap::from([
+            (
+                "main.obj".into(),
+                ObjectGroup {
+                    functions: vec![0x401000],
+                    ..Default::default()
+                },
+            ),
+            (
+                "helper.obj".into(),
+                ObjectGroup {
+                    functions: vec![0x401010],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let dir = std::env::temp_dir().join(format!("delink-ida-linkage-{}", std::process::id()));
+        let outcomes =
+            split_by_groups(&model, &pe, &symbols, &groups, &dir, OutputFormat::Coff).unwrap();
+        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+
+        let bytes = std::fs::read(dir.join("helper.obj")).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let helper = file
+            .symbols()
+            .find(|symbol| symbol.name().unwrap() == "_helper")
+            .unwrap();
+        assert!(helper.is_global());
+
+        let bytes = std::fs::read(dir.join("main.obj")).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let reference = file
+            .symbols()
+            .find(|symbol| symbol.name().unwrap() == "_helper")
+            .unwrap();
+        assert!(reference.is_undefined());
+
+        let shared = dir.join("__shared_data.obj");
+        emit_shared_for_groups(&model, &pe, &symbols, &groups, &shared, OutputFormat::Coff)
+            .unwrap();
+        let bytes = std::fs::read(&shared).unwrap();
+        let file = object::File::parse(bytes.as_slice()).unwrap();
+        let handler = file
+            .symbols()
+            .find(|symbol| symbol.name().unwrap() == "handler")
+            .unwrap();
+        assert!(handler.is_global());
+        let imported = file
+            .symbols()
+            .find(|symbol| symbol.name().unwrap() == "ImportedApi")
+            .unwrap();
+        assert!(imported.is_global());
+        assert_eq!(section_data(&shared, ".text")[3], 0xc3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn extracts_pe_resource_records_in_payload_order() {
+        let (mut model, _, _) = test_model();
+        model.sections.clear();
+        let mut raw = vec![0u8; 91];
+        raw[14..16].copy_from_slice(&1u16.to_le_bytes());
+        raw[16..20].copy_from_slice(&10u32.to_le_bytes());
+        raw[20..24].copy_from_slice(&0x8000_0018u32.to_le_bytes());
+        raw[24 + 14..24 + 16].copy_from_slice(&1u16.to_le_bytes());
+        raw[40..44].copy_from_slice(&1u32.to_le_bytes());
+        raw[44..48].copy_from_slice(&0x8000_0030u32.to_le_bytes());
+        raw[48 + 14..48 + 16].copy_from_slice(&1u16.to_le_bytes());
+        raw[64..68].copy_from_slice(&1033u32.to_le_bytes());
+        raw[68..72].copy_from_slice(&72u32.to_le_bytes());
+        raw[72..76].copy_from_slice(&0x158u32.to_le_bytes());
+        raw[76..80].copy_from_slice(&3u32.to_le_bytes());
+        raw[88..91].copy_from_slice(b"ABC");
+        let pe = PeImage {
+            arch: PeArch::X86,
+            image_base: 0x1000,
+            sections: vec![PeSection {
+                name: ".rsrc".into(),
+                rva: 0x100,
+                va: 0x1100,
+                virtual_size: raw.len() as u64,
+                data: raw,
+                characteristics: 0,
+            }],
+            base_relocations: vec![],
+        };
+        let path = std::env::temp_dir().join(format!("delink-res-{}.res", std::process::id()));
+        assert_eq!(emit_pe_resources(&model, &pe, &path).unwrap(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(resource_dword(&bytes, 0).unwrap(), 0);
+        assert_eq!(resource_dword(&bytes, 32).unwrap(), 3);
+        assert_eq!(&bytes[64..67], b"ABC");
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn test_model() -> (IdaModel, PeImage, IdaSymbols) {
         let model = IdaModel {

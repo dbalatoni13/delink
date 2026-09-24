@@ -18,8 +18,10 @@
 //! `idapro.json` mapping each output object filename to explicit function start
 //! addresses, optional whole-function ranges, and optional `.rdata` / `.data`
 //! / logical `.bss`
-//! address ranges. Names, bounds, and visibility always come from the exported
-//! model; see [`idapro_json`].
+//! address ranges. Names and bounds come from the exported model; named
+//! functions and data are emitted with external linkage so separate objects
+//! can reference them even when IDA did not mark them public. See
+//! [`idapro_json`].
 //!
 //! The original input can be a PE image or an original Xbox XBE. XBE section
 //! bytes are loaded from the XBE section table, while absolute relocations come
@@ -377,7 +379,7 @@ pub fn load(path: &Path) -> Result<IdaModel> {
         })
         .collect();
 
-    let functions: Vec<Function> = raw
+    let mut functions: Vec<Function> = raw
         .functions
         .into_iter()
         .map(|f| {
@@ -401,6 +403,7 @@ pub fn load(path: &Path) -> Result<IdaModel> {
             })
         })
         .collect::<Result<_>>()?;
+    functions.sort_by_key(|function| function.start);
 
     let names: Vec<Name> = raw
         .names
@@ -511,8 +514,25 @@ pub fn combined_relocations(model: &IdaModel, pe: &PeImage) -> Vec<Reloc> {
 
     let mut by_addr: BTreeMap<u64, Reloc> = BTreeMap::new();
 
-    // 1) IDA fixups — already in IDA VA with resolved targets.
+    // 1) IDA fixups and offset-typed operands. An offset operand can describe
+    // a structure member displacement rather than an address; only recover an
+    // absolute relocation when the encoded value agrees with its target.
     for r in &model.relocations {
+        let Some(bytes) = pe.data_at_rva(r.addr.wrapping_sub(model.image_base), r.size as usize)
+        else {
+            continue;
+        };
+        let stored = match r.size {
+            4 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+            8 => u64::from_le_bytes(bytes.try_into().unwrap()),
+            _ => continue,
+        };
+        let rebased = model
+            .image_base
+            .wrapping_add(stored.wrapping_sub(pe.image_base));
+        if stored != r.target && rebased != r.target {
+            continue;
+        }
         by_addr.insert(r.addr, r.clone());
     }
 

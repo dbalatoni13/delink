@@ -54,6 +54,30 @@ has to link against IDA:
    delink ida-split delink.ida.json binary.exe -o ./output
    ```
 
+   COFF splits preserve layout by default: subsections are ordered by their
+   original virtual addresses, so the linker can place recovered code and data
+   gaps in that order. Use `--compact-layout` to pack contributions instead.
+   Preserving layout does not by itself recreate PE resources, import-directory
+   headers, or build-specific header fields.
+
+   For PE inputs with resources, the split also writes
+   `__pe_resources.res`. Pass that file alongside the emitted `.obj` files to
+   MSVC `link.exe`; the linker rebuilds the resource directory and payloads.
+   When the linked sections retain their original addresses and sizes, restore
+   the original PE header and untouched sections with:
+
+   ```shell
+   delink ida-restore-pe original.exe linked.exe -o restored.exe
+   ```
+
+   The emitted COFF objects can be linked with objects compiled from source.
+   For a 32-bit MSVC build, include the split objects you need and compile your
+   replacement source for x86 without LTCG. Omit the split object that defines
+   the function you replaced. IDA's public flag is not used to restrict COFF
+   linkage: a named function or data symbol remains available to other objects.
+   Declare retained globals with `extern` in replacement source to avoid
+   defining them again.
+
    Original Xbox XBE files are supported by the same IDA workflow. Import the
    `.xbe` with an XBE loader in IDA, run the exporter, then pass the original
    XBE as the binary:
