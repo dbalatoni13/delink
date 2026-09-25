@@ -660,21 +660,46 @@ def export_offset_relocations(ptr_size):
                                 "target": target,
                             }
                         )
-            elif offsets[0]:  # data offset item — the field is the item itself
-                size = ptr_size
-                if size == 8:
-                    target = int(ida_bytes.get_qword(ea))
-                else:
-                    size = 4
-                    target = int(ida_bytes.get_dword(ea))
-                out.append(
-                    {
-                        "addr": int(ea),
-                        "type": "OFF%d" % (size * 8),
-                        "size": size,
-                        "target": target,
-                    }
-                )
+            else:
+                data_refs = {int(ref) for ref in idautils.DataRefsFrom(ea)}
+                if offsets[0]:  # data offset item — the field is the item itself
+                    size = ptr_size
+                    if size == 8:
+                        target = int(ida_bytes.get_qword(ea))
+                    else:
+                        size = 4
+                        target = int(ida_bytes.get_dword(ea))
+                    out.append(
+                        {
+                            "addr": int(ea),
+                            "type": "OFF%d" % (size * 8),
+                            "size": size,
+                            "target": target,
+                        }
+                    )
+                elif data_refs:
+                    # IDA can attach a data xref inside a structure/array to
+                    # the item's head instead of the pointer field. Scan the
+                    # item's bytes for pointer-width values matching those
+                    # xref targets, then export the relocation at the field.
+                    item_size = int(ida_bytes.get_item_size(ea))
+                    if ptr_size in (4, 8) and item_size >= ptr_size:
+                        for offset in range(item_size - ptr_size + 1):
+                            field = ea + offset
+                            if ptr_size == 8:
+                                target = int(ida_bytes.get_qword(field))
+                            else:
+                                target = int(ida_bytes.get_dword(field))
+                            if target not in data_refs:
+                                continue
+                            out.append(
+                                {
+                                    "addr": int(field),
+                                    "type": "OFF%d" % (ptr_size * 8),
+                                    "size": ptr_size,
+                                    "target": target,
+                                }
+                            )
             nh = ida_bytes.next_head(ea, end)
             if nh <= ea:
                 break

@@ -1005,9 +1005,9 @@ fn emit_object(
         });
         local.insert(name.clone(), sym_id);
 
-        // A code label inside a function may be the target of a relocation
-        // from another object. Its name must be defined at the original
-        // offset within this function's emitted bytes.
+        // Preserve named code labels at their original offsets. COFF function
+        // auxiliary records below carry the enclosing function's real size,
+        // so these externally visible names do not truncate it in objdiff.
         for (_, names) in code_names.range(start..emit_end) {
             for label in names {
                 if label.name == *name {
@@ -2066,6 +2066,190 @@ fn split_meta_note(virtual_addresses: &[u64], is_64: bool) -> Result<Vec<u8>> {
     Ok(note)
 }
 
+const COFF_HEADER_SIZE: usize = 20;
+const COFF_SECTION_HEADER_SIZE: usize = 40;
+const COFF_SYMBOL_SIZE: usize = 18;
+const COFF_RELOCATION_SIZE: usize = 10;
+const COFF_SCN_LNK_NRELOC_OVFL: u32 = 0x0100_0000;
+
+fn coff_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| anyhow!("truncated COFF u16 at {offset:#x}"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn coff_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("truncated COFF u32 at {offset:#x}"))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn coff_symbol_layout(bytes: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    if bytes.len() < COFF_HEADER_SIZE {
+        return Err(anyhow!("truncated COFF file header"));
+    }
+    let section_count = coff_u16(bytes, 2)? as usize;
+    let symbol_offset = coff_u32(bytes, 8)? as usize;
+    let symbol_count = coff_u32(bytes, 12)? as usize;
+    let optional_size = coff_u16(bytes, 16)? as usize;
+    let section_offset = COFF_HEADER_SIZE + optional_size;
+    let sections_end = section_offset
+        .checked_add(section_count * COFF_SECTION_HEADER_SIZE)
+        .ok_or_else(|| anyhow!("COFF section table size overflow"))?;
+    if sections_end > bytes.len() {
+        return Err(anyhow!("truncated COFF section table"));
+    }
+    let symbol_end = symbol_offset
+        .checked_add(symbol_count * COFF_SYMBOL_SIZE)
+        .ok_or_else(|| anyhow!("COFF symbol table size overflow"))?;
+    if symbol_offset == 0 || symbol_end > bytes.len() {
+        return Err(anyhow!("invalid COFF symbol table bounds"));
+    }
+    Ok((section_offset, section_count, symbol_offset, symbol_count))
+}
+
+/// Find emitted function symbols whose size should be recorded in a COFF
+/// function auxiliary record. The object crate currently omits these records
+/// when writing symbols, even though its reader uses them to recover function
+/// sizes.
+fn coff_function_auxes(bytes: &[u8], model: &IdaModel) -> Result<Vec<(usize, u32)>> {
+    let (_, _, symbol_offset, symbol_count) = coff_symbol_layout(bytes)?;
+    let file = object::File::parse(bytes).context("parse emitted COFF object")?;
+    let mut functions = Vec::new();
+    for symbol in file.symbols() {
+        if symbol.kind() != SymbolKind::Text || symbol.is_undefined() {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        let Some(function) = model
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+        else {
+            continue;
+        };
+        let index = symbol.index().0;
+        if index >= symbol_count {
+            return Err(anyhow!("COFF function symbol index is out of bounds"));
+        }
+        let raw = symbol_offset + index * COFF_SYMBOL_SIZE;
+        let aux_count = *bytes
+            .get(raw + 17)
+            .ok_or_else(|| anyhow!("truncated COFF function symbol"))?;
+        if aux_count != 0 {
+            return Err(anyhow!(
+                "COFF function '{}' already has {aux_count} auxiliary symbols",
+                function.name
+            ));
+        }
+        let size = u32::try_from(function.size())
+            .context("COFF function size exceeds the auxiliary record limit")?;
+        if size != 0 {
+            functions.push((index, size));
+        }
+    }
+    functions.sort_unstable_by_key(|&(index, _)| index);
+    Ok(functions)
+}
+
+/// Add canonical COFF function auxiliary records and update relocation symbol
+/// indices to account for the inserted raw symbol-table entries.
+fn add_coff_function_auxes(mut bytes: Vec<u8>, function_auxes: &[(usize, u32)]) -> Result<Vec<u8>> {
+    if function_auxes.is_empty() {
+        return Ok(bytes);
+    }
+    let (section_offset, section_count, symbol_offset, symbol_count) = coff_symbol_layout(&bytes)?;
+    let mut sizes = HashMap::with_capacity(function_auxes.len());
+    for &(index, size) in function_auxes {
+        if index >= symbol_count || sizes.insert(index, size).is_some() {
+            return Err(anyhow!("invalid or duplicate COFF function symbol index"));
+        }
+    }
+
+    let mut new_symbols =
+        Vec::with_capacity((symbol_count + function_auxes.len()) * COFF_SYMBOL_SIZE);
+    let mut old_to_new = vec![usize::MAX; symbol_count];
+    let mut old_index = 0usize;
+    while old_index < symbol_count {
+        let raw = symbol_offset + old_index * COFF_SYMBOL_SIZE;
+        let aux_count = *bytes
+            .get(raw + 17)
+            .ok_or_else(|| anyhow!("truncated COFF symbol table"))?
+            as usize;
+        let record_count = 1 + aux_count;
+        if old_index + record_count > symbol_count {
+            return Err(anyhow!("invalid COFF auxiliary symbol count"));
+        }
+        let new_index = new_symbols.len() / COFF_SYMBOL_SIZE;
+        old_to_new[old_index] = new_index;
+        new_symbols.extend_from_slice(&bytes[raw..raw + COFF_SYMBOL_SIZE]);
+        if let Some(&size) = sizes.get(&old_index) {
+            if aux_count != 0 {
+                return Err(anyhow!(
+                    "function symbol unexpectedly has auxiliary records"
+                ));
+            }
+            new_symbols[new_index * COFF_SYMBOL_SIZE + 17] = 1;
+            let mut aux = [0u8; COFF_SYMBOL_SIZE];
+            aux[4..8].copy_from_slice(&size.to_le_bytes());
+            new_symbols.extend_from_slice(&aux);
+        }
+        for aux_index in 0..aux_count {
+            old_to_new[old_index + 1 + aux_index] = new_symbols.len() / COFF_SYMBOL_SIZE;
+            let aux_start = raw + (1 + aux_index) * COFF_SYMBOL_SIZE;
+            new_symbols.extend_from_slice(&bytes[aux_start..aux_start + COFF_SYMBOL_SIZE]);
+        }
+        old_index += record_count;
+    }
+
+    // Relocation records refer to raw COFF symbol indices. Remap them before
+    // replacing the symbol table; section data and relocation offsets stay put.
+    for section_index in 0..section_count {
+        let header = section_offset + section_index * COFF_SECTION_HEADER_SIZE;
+        let relocation_offset = coff_u32(&bytes, header + 24)? as usize;
+        let relocation_count = coff_u16(&bytes, header + 32)? as usize;
+        let characteristics = coff_u32(&bytes, header + 36)?;
+        if relocation_count == 0 {
+            continue;
+        }
+        let (first, count) = if relocation_count == u16::MAX as usize
+            && characteristics & COFF_SCN_LNK_NRELOC_OVFL != 0
+        {
+            let total = coff_u32(&bytes, relocation_offset)? as usize;
+            if total == 0 {
+                return Err(anyhow!("invalid COFF relocation overflow count"));
+            }
+            (relocation_offset + COFF_RELOCATION_SIZE, total - 1)
+        } else {
+            (relocation_offset, relocation_count)
+        };
+        for relocation_index in 0..count {
+            let index_offset = first + relocation_index * COFF_RELOCATION_SIZE + 4;
+            let old_symbol = coff_u32(&bytes, index_offset)? as usize;
+            let new_symbol = *old_to_new
+                .get(old_symbol)
+                .ok_or_else(|| anyhow!("COFF relocation symbol index is out of bounds"))?;
+            let new_symbol = u32::try_from(new_symbol)
+                .context("COFF symbol index exceeds relocation field limit")?;
+            bytes[index_offset..index_offset + 4].copy_from_slice(&new_symbol.to_le_bytes());
+        }
+    }
+
+    let new_symbol_count = u32::try_from(new_symbols.len() / COFF_SYMBOL_SIZE)
+        .context("COFF symbol table exceeds file header limit")?;
+    let symbol_end = symbol_offset + symbol_count * COFF_SYMBOL_SIZE;
+    let mut result = Vec::with_capacity(bytes.len() + function_auxes.len() * COFF_SYMBOL_SIZE);
+    result.extend_from_slice(&bytes[..symbol_offset]);
+    result.extend_from_slice(&new_symbols);
+    result.extend_from_slice(&bytes[symbol_end..]);
+    result[12..16].copy_from_slice(&new_symbol_count.to_le_bytes());
+    Ok(result)
+}
+
 /// Attach objdiff/decomp-toolkit split metadata. The VIRT array is indexed by
 /// the raw object symbol-table index, including any COFF auxiliary-symbol gaps.
 fn write_object_with_split_meta(obj: &mut Object<'_>, model: &IdaModel) -> Result<Vec<u8>> {
@@ -2080,11 +2264,20 @@ fn write_object_with_split_meta(obj: &mut Object<'_>, model: &IdaModel) -> Resul
     let provisional = obj.write().context("serialize object for split metadata")?;
     let file =
         object::File::parse(provisional.as_slice()).context("parse object for split metadata")?;
-    let symbol_count = file
-        .symbols()
-        .map(|symbol| symbol.index().0 + 1)
-        .max()
-        .unwrap_or(0);
+    let is_coff = obj.format() == BinaryFormat::Coff;
+    let symbol_count = if is_coff {
+        coff_symbol_layout(&provisional)?.3
+    } else {
+        file.symbols()
+            .map(|symbol| symbol.index().0 + 1)
+            .max()
+            .unwrap_or(0)
+    };
+    let function_auxes = if is_coff {
+        coff_function_auxes(&provisional, model)?
+    } else {
+        Vec::new()
+    };
     let mut virtual_addresses = vec![0u64; symbol_count];
     for symbol in file.symbols() {
         if symbol.is_undefined() {
@@ -2097,10 +2290,24 @@ fn write_object_with_split_meta(obj: &mut Object<'_>, model: &IdaModel) -> Resul
             virtual_addresses[symbol.index().0] = address;
         }
     }
+    if is_coff && !function_auxes.is_empty() {
+        let mut expanded = vec![0u64; symbol_count + function_auxes.len()];
+        for (index, address) in virtual_addresses.into_iter().enumerate() {
+            let inserted_before =
+                function_auxes.partition_point(|&(function_index, _)| function_index < index);
+            expanded[index + inserted_before] = address;
+        }
+        virtual_addresses = expanded;
+    }
     drop(file);
     let note = split_meta_note(&virtual_addresses, model.bits == 64)?;
     obj.append_section_data(note_sid, &note, 4);
-    obj.write().context("serialize object")
+    let bytes = obj.write().context("serialize object")?;
+    if is_coff {
+        add_coff_function_auxes(bytes, &function_auxes)
+    } else {
+        Ok(bytes)
+    }
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2156,7 +2363,7 @@ mod tests {
             functions: vec![
                 Function {
                     start: 0x401000,
-                    end: 0x401005,
+                    end: 0x401008,
                     name: "_main".into(),
                     thunk: false,
                     lib: false,
@@ -2174,6 +2381,14 @@ mod tests {
                 },
             ],
             names: vec![
+                crate::Name {
+                    addr: 0x401005,
+                    size: 0,
+                    name: "inside_main".into(),
+                    public: false,
+                    weak: false,
+                    is_func: false,
+                },
                 crate::Name {
                     addr: 0x401008,
                     size: 0,
@@ -2249,11 +2464,31 @@ mod tests {
 
         let bytes = std::fs::read(dir.join("main.obj")).unwrap();
         let file = object::File::parse(bytes.as_slice()).unwrap();
+        let inside_main = file
+            .symbols()
+            .find(|symbol| symbol.name().unwrap() == "inside_main")
+            .unwrap();
+        assert!(inside_main.is_global());
+        assert_eq!(inside_main.kind(), object::SymbolKind::Data);
+        let main = file
+            .symbols()
+            .find(|symbol| symbol.name().unwrap() == "_main")
+            .unwrap();
+        assert_eq!(main.size(), 8);
         let reference = file
             .symbols()
             .find(|symbol| symbol.name().unwrap() == "_helper")
             .unwrap();
         assert!(reference.is_undefined());
+        let text = file.section_by_name(".text").unwrap();
+        let relocation = text.relocations().next().unwrap().1;
+        let object::RelocationTarget::Symbol(target) = relocation.target() else {
+            panic!("call relocation does not target a symbol");
+        };
+        assert_eq!(
+            file.symbol_by_index(target).unwrap().name().unwrap(),
+            "_helper"
+        );
 
         let shared = dir.join("__shared_data.obj");
         emit_shared_for_groups(&model, &pe, &symbols, &groups, &shared, OutputFormat::Coff)
@@ -2270,7 +2505,7 @@ mod tests {
             .find(|symbol| symbol.name().unwrap() == "ImportedApi")
             .unwrap();
         assert!(imported.is_global());
-        assert_eq!(section_data(&shared, ".text")[3], 0xc3);
+        assert_eq!(section_data(&shared, ".text")[0], 0xc3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
