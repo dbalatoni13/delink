@@ -797,7 +797,6 @@ fn emit_object(
 
     // Create code sections in address order. LINK keeps contributions with
     // ordinary section names in their object and input order.
-    let mut code_sections = HashMap::new();
     let mut code_gaps = Vec::new();
     let mut gap_table_names = HashSet::new();
     let mut occupied = Vec::new();
@@ -822,19 +821,90 @@ fn emit_object(
     for configured in &group.function_ranges {
         code_gaps.extend(subtract_ranges(configured.range(), &occupied));
     }
-    let mut starts: Vec<u64> = funcs.iter().map(|f| f.start).collect();
-    starts.extend(code_gaps.iter().map(|gap| gap.start));
-    starts.sort_unstable();
-    for start in starts {
-        let sid = obj.add_section(Vec::new(), text_name.as_bytes().to_vec(), SectionKind::Text);
-        code_sections.insert(start, sid);
-    }
+    code_gaps.sort_by_key(|gap| gap.start);
+    let text_sid = obj.add_section(Vec::new(), text_name.as_bytes().to_vec(), SectionKind::Text);
 
+    // Append code-range gaps into the shared .text section in address order.
+    // Their symbols and relocations need the section offset returned here.
+    let emit_gap = |gap: Range<u64>,
+                    obj: &mut Object<'_>,
+                    pending: &mut Vec<Pending>,
+                    local: &mut HashMap<String, SymbolId>,
+                    stats: &mut EmitStats|
+     -> Result<()> {
+        let mut bytes = read_padded(
+            pe,
+            gap.start - model.image_base,
+            (gap.end - gap.start) as usize,
+        );
+        let mut gap_relocs = Vec::new();
+        for reloc in symbols.relocs_in(gap.clone()) {
+            let Some(flags) = abs_flags(format, model.arch, reloc.size) else {
+                continue;
+            };
+            let Some((name, addend)) = resolve_split_data(symbols, owned_ranges, reloc.target)
+            else {
+                continue;
+            };
+            let offset = (reloc.addr - gap.start) as usize;
+            let width = reloc.size as usize;
+            if offset + width > bytes.len() {
+                continue;
+            }
+            bytes[offset..offset + width].fill(0);
+            gap_relocs.push((offset as u64, name, addend, flags));
+        }
+        let gap_off = obj.append_section_data(text_sid, &bytes, 1);
+        for (offset, name, addend, flags) in gap_relocs {
+            pending.push(Pending {
+                sid: text_sid,
+                offset: gap_off + offset,
+                sym: name,
+                addend,
+                flags,
+            });
+        }
+        stats.text_bytes += gap.end - gap.start;
+        for (_, names) in code_names.range(gap.clone()) {
+            for label in names {
+                if gap_table_names.contains(&label.name) {
+                    continue;
+                }
+                let id = obj.add_symbol(Symbol {
+                    name: sanitize_symbol_name(&label.name),
+                    value: gap_off + label.addr - gap.start,
+                    size: label.size,
+                    kind: SymbolKind::Data,
+                    scope: SymbolScope::Dynamic,
+                    weak: false,
+                    section: SymbolSection::Section(text_sid),
+                    flags: SymbolFlags::None,
+                });
+                local.entry(label.name.clone()).or_insert(id);
+            }
+        }
+        Ok(())
+    };
+
+    let mut next_gap = 0;
     for f in &funcs {
+        while code_gaps
+            .get(next_gap)
+            .is_some_and(|gap| gap.start < f.start)
+        {
+            emit_gap(
+                code_gaps[next_gap].clone(),
+                &mut obj,
+                &mut pending,
+                &mut local,
+                &mut stats,
+            )?;
+            next_gap += 1;
+        }
         let name = &f.name;
         let start = f.start;
         let end = f.end;
-        let sid = code_sections[&start];
+        let sid = text_sid;
         let owner_section = model.section_for(start);
         let mut tables: Vec<JumpTable> = model
             .jump_tables
@@ -1147,58 +1217,10 @@ fn emit_object(
         }
     }
 
-    // Keep bytes between functions in the object that owns their configured
-    // code range. Source-compiled objects contain these bytes (often alignment
-    // padding) alongside the functions, so they must not go to __shared_data.
-    for gap in code_gaps {
-        let sid = code_sections[&gap.start];
-        let mut bytes = read_padded(
-            pe,
-            gap.start - model.image_base,
-            (gap.end - gap.start) as usize,
-        );
-        for reloc in symbols.relocs_in(gap.clone()) {
-            let Some(flags) = abs_flags(format, model.arch, reloc.size) else {
-                continue;
-            };
-            let Some((name, addend)) = resolve_split_data(symbols, owned_ranges, reloc.target)
-            else {
-                continue;
-            };
-            let offset = (reloc.addr - gap.start) as usize;
-            let width = reloc.size as usize;
-            if offset + width > bytes.len() {
-                continue;
-            }
-            bytes[offset..offset + width].fill(0);
-            pending.push(Pending {
-                sid,
-                offset: offset as u64,
-                sym: name,
-                addend,
-                flags,
-            });
-        }
-        obj.append_section_data(sid, &bytes, 1);
-        stats.text_bytes += gap.end - gap.start;
-        for (_, names) in code_names.range(gap.clone()) {
-            for label in names {
-                if gap_table_names.contains(&label.name) {
-                    continue;
-                }
-                let id = obj.add_symbol(Symbol {
-                    name: sanitize_symbol_name(&label.name),
-                    value: label.addr - gap.start,
-                    size: label.size,
-                    kind: SymbolKind::Data,
-                    scope: SymbolScope::Dynamic,
-                    weak: false,
-                    section: SymbolSection::Section(sid),
-                    flags: SymbolFlags::None,
-                });
-                local.entry(label.name.clone()).or_insert(id);
-            }
-        }
+    // Append any trailing unnamed bytes after the final function.
+    while let Some(gap) = code_gaps.get(next_gap) {
+        emit_gap(gap.clone(), &mut obj, &mut pending, &mut local, &mut stats)?;
+        next_gap += 1;
     }
 
     // Emit the configured initialized-data contributions into this object.
