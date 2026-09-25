@@ -7,11 +7,11 @@
 //! ```json
 //! {
 //!   "Alchemy.dll.obj": {
-//!     "functions": [268441600, 268441648],
-//!     "function_ranges": [[268442000, 268443000]],
-//!     "rdata": [[268500992, 268501120]],
-//!     "data": [[268566528, 268566592]],
-//!     "bss": [[268570624, 268571648]]
+//!     "functions": ["0x1000", "0x1030"],
+//!     "function_ranges": [["0x2000", "0x23E8"]],
+//!     "rdata": [["0x11000", "0x11080"]],
+//!     "data": [["0x21000", "0x21040"]],
+//!     "bss": [["0x22000", "0x22400"]]
 //!   }
 //! }
 //! ```
@@ -21,15 +21,92 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use serde::de::Error as _;
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 
 use crate::IdaModel;
 
 /// A half-open IDA virtual-address range, serialized as the JSON pair
 /// `[start, end]` representing `[start, end)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataRange(pub [u64; 2]);
+
+impl Serialize for DataRange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        seq.serialize_element(&format!("0x{:X}", self.0[0]))?;
+        seq.serialize_element(&format!("0x{:X}", self.0[1]))?;
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DataRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = Vec::<HexU64>::deserialize(deserializer)?;
+        let [start, end] = values.as_slice() else {
+            return Err(D::Error::custom("address range must contain two values"));
+        };
+        Ok(Self([start.0, end.0]))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HexU64(u64);
+
+impl<'de> Deserialize<'de> for HexU64 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(text) => {
+                let hex = text
+                    .strip_prefix("0x")
+                    .or_else(|| text.strip_prefix("0X"))
+                    .ok_or_else(|| D::Error::custom("address must be hexadecimal"))?;
+                u64::from_str_radix(hex, 16)
+                    .map(Self)
+                    .map_err(D::Error::custom)
+            }
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .map(Self)
+                .ok_or_else(|| D::Error::custom("address must be nonnegative")),
+            _ => Err(D::Error::custom(
+                "address must be hexadecimal or an integer",
+            )),
+        }
+    }
+}
+
+fn deserialize_u64_vec<'de, D>(deserializer: D) -> Result<Vec<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Vec::<HexU64>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| value.0)
+        .collect())
+}
+
+fn serialize_u64_vec<S>(values: &[u64], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(values.len()))?;
+    for value in values {
+        seq.serialize_element(&format!("0x{value:X}"))?;
+    }
+    seq.end()
+}
 
 impl DataRange {
     pub fn range(self) -> Range<u64> {
@@ -40,7 +117,7 @@ impl DataRange {
 /// Contents assigned to one output object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ObjectGroup {
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_u64_vec")]
     pub functions: Vec<u64>,
     /// Half-open ranges selecting whole functions by their `[start, end)`
     /// bounds. A range may not cut through a function.
@@ -58,7 +135,7 @@ pub struct ObjectGroup {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct DetailedObjectGroup {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u64_vec")]
     functions: Vec<u64>,
     #[serde(default)]
     function_ranges: Vec<DataRange>,
@@ -74,7 +151,7 @@ struct DetailedObjectGroup {
 #[serde(untagged)]
 enum ObjectGroupInput {
     Detailed(DetailedObjectGroup),
-    Functions(Vec<u64>),
+    Functions(Vec<HexU64>),
 }
 
 impl<'de> Deserialize<'de> for ObjectGroup {
@@ -91,7 +168,7 @@ impl<'de> Deserialize<'de> for ObjectGroup {
                 bss: group.bss,
             },
             ObjectGroupInput::Functions(functions) => Self {
-                functions,
+                functions: functions.into_iter().map(|address| address.0).collect(),
                 ..Self::default()
             },
         })
@@ -162,6 +239,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_hexadecimal_addresses() {
+        let json: IdaproJson = serde_json::from_str(
+            r#"{"one.obj":{"functions":["0x1000"],"rdata":[["0x2000","0x2010"]]}}"#,
+        )
+        .unwrap();
+        assert_eq!(json["one.obj"].functions, vec![0x1000]);
+        assert_eq!(json["one.obj"].rdata[0].range(), 0x2000..0x2010);
+    }
+
+    #[test]
     fn serializes_the_editable_data_fields() {
         let json = IdaproJson::from([(
             "one.obj".to_string(),
@@ -171,10 +258,19 @@ mod tests {
             },
         )]);
         let value = serde_json::to_value(json).unwrap();
-        assert_eq!(value["one.obj"]["functions"], serde_json::json!([4096]));
+        assert_eq!(value["one.obj"]["functions"], serde_json::json!(["0x1000"]));
         assert_eq!(value["one.obj"]["function_ranges"], serde_json::json!([]));
         assert_eq!(value["one.obj"]["rdata"], serde_json::json!([]));
         assert_eq!(value["one.obj"]["data"], serde_json::json!([]));
         assert_eq!(value["one.obj"]["bss"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn serializes_ranges_as_hexadecimal_strings() {
+        let range = DataRange([0x401000, 0x401010]);
+        assert_eq!(
+            serde_json::to_value(range).unwrap(),
+            serde_json::json!(["0x401000", "0x401010"])
+        );
     }
 }

@@ -223,10 +223,13 @@ struct RawMeta {
     procname: String,
     bits: u32,
     endian: String,
+    #[serde(deserialize_with = "deserialize_address")]
     image_base: u64,
     #[allow(dead_code)]
+    #[serde(deserialize_with = "deserialize_address")]
     min_ea: u64,
     #[allow(dead_code)]
+    #[serde(deserialize_with = "deserialize_address")]
     max_ea: u64,
     filetype: String,
     input_file: String,
@@ -235,7 +238,9 @@ struct RawMeta {
 #[derive(Deserialize)]
 struct RawSegment {
     name: String,
+    #[serde(deserialize_with = "deserialize_address")]
     start: u64,
+    #[serde(deserialize_with = "deserialize_address")]
     end: u64,
     perm_r: bool,
     perm_w: bool,
@@ -248,8 +253,9 @@ struct RawSegment {
 
 #[derive(Deserialize)]
 struct RawFunction {
+    #[serde(deserialize_with = "deserialize_address")]
     start: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_address")]
     end: Option<u64>,
     #[serde(default)]
     size: Option<serde_json::Value>,
@@ -260,11 +266,13 @@ struct RawFunction {
     is_static: bool,
     public: bool,
     #[allow(dead_code)]
+    #[serde(default, deserialize_with = "deserialize_optional_address")]
     thunk_target: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct RawName {
+    #[serde(deserialize_with = "deserialize_address")]
     addr: u64,
     #[serde(default)]
     size: Option<serde_json::Value>,
@@ -276,28 +284,73 @@ struct RawName {
 
 #[derive(Deserialize)]
 struct RawReloc {
+    #[serde(deserialize_with = "deserialize_address")]
     addr: u64,
     #[serde(rename = "type")]
     kind: String,
     size: u32,
+    #[serde(deserialize_with = "deserialize_address")]
     target: u64,
 }
 
 #[derive(Deserialize)]
 struct RawJumpTableEntry {
+    #[serde(deserialize_with = "deserialize_address")]
     addr: u64,
+    #[serde(deserialize_with = "deserialize_address")]
     target: u64,
 }
 
 #[derive(Deserialize)]
 struct RawJumpTable {
+    #[serde(deserialize_with = "deserialize_address")]
     owner: u64,
+    #[serde(deserialize_with = "deserialize_address")]
     dispatch: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_address")]
     dispatch_addr: Option<u64>,
+    #[serde(deserialize_with = "deserialize_address")]
     start: u64,
     entry_size: u32,
     entries: Vec<RawJumpTableEntry>,
     name: String,
+}
+
+fn deserialize_address<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    parse_address(&value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_address<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .as_ref()
+        .map(parse_address)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn parse_address(value: &serde_json::Value) -> Result<u64> {
+    match value {
+        serde_json::Value::String(text) => {
+            let hex = text
+                .strip_prefix("0x")
+                .or_else(|| text.strip_prefix("0X"))
+                .context("address must be a hexadecimal string such as 0x401000")?;
+            u64::from_str_radix(hex, 16).context("invalid hexadecimal address")
+        }
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .context("address must be a nonnegative integer"),
+        _ => bail!("address must be a hexadecimal string or integer"),
+    }
 }
 
 fn parse_size(value: &serde_json::Value) -> Result<u64> {
@@ -605,6 +658,26 @@ mod size_tests {
         assert_eq!(parse_size(&serde_json::json!("0xC")).unwrap(), 12);
         assert_eq!(parse_size(&serde_json::json!("0x10")).unwrap(), 16);
         assert!(parse_size(&serde_json::json!("12")).is_err());
+    }
+
+    #[test]
+    fn parses_hexadecimal_and_legacy_numeric_addresses() {
+        #[derive(Deserialize)]
+        struct AddressTest {
+            #[serde(deserialize_with = "deserialize_address")]
+            hex: u64,
+            #[serde(deserialize_with = "deserialize_address")]
+            numeric: u64,
+            #[serde(default, deserialize_with = "deserialize_optional_address")]
+            optional: Option<u64>,
+        }
+
+        let parsed: AddressTest =
+            serde_json::from_str(r#"{"hex":"0x401000","numeric":4198416,"optional":"0x401020"}"#)
+                .unwrap();
+        assert_eq!(parsed.hex, 0x401000);
+        assert_eq!(parsed.numeric, 0x401010);
+        assert_eq!(parsed.optional, Some(0x401020));
     }
 
     #[test]

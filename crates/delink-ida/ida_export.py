@@ -3,8 +3,8 @@ delink IDA exporter
 ===================
 
 Run this inside IDA (9.x) to export the *information* delink needs to split the
-analysed binary into relocatable objects -- but **not** the bytes.  The export
-is small and human-readable (pretty-printed JSON) and contains: the
+analysed binary into relocatable objects -- but **not** the bytes. The export
+is compact and human-readable (one record per line) and contains the
 architecture/segment layout, every function (boundaries + flags), every named
 address, and the relocations IDA knows about. Data targets that IDA renders
 with an auto-name but does not store in its named-address table are exported
@@ -62,6 +62,106 @@ import idc
 SCHEMA_VERSION = 3
 
 BADADDR = idaapi.BADADDR
+
+
+def _hex_address(value):
+    return None if value is None else "0x%X" % int(value)
+
+
+def _compact_json_dumps(value):
+    """Pretty-print containers while keeping scalar records on one line."""
+    def inline(value):
+        return json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
+
+    def is_scalar(value):
+        return not isinstance(value, (dict, list))
+
+    def is_inline_object(value):
+        if not isinstance(value, dict):
+            return False
+        if all(is_scalar(item) for item in value.values()):
+            return True
+        if all(
+            is_scalar(item)
+            or (isinstance(item, list) and all(is_scalar(child) for child in item))
+            for item in value.values()
+        ):
+            return len(inline(value)) <= 180
+        return False
+
+    def render(value, depth):
+        pad = "  " * depth
+        child_pad = "  " * (depth + 1)
+        if is_scalar(value):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, dict):
+            if is_inline_object(value):
+                return inline(value)
+            if not value:
+                return "{}"
+            rows = [
+                child_pad
+                + json.dumps(key, ensure_ascii=False)
+                + ": "
+                + render(item, depth + 1)
+                for key, item in value.items()
+            ]
+            return "{\n" + ",\n".join(rows) + "\n" + pad + "}"
+        if not value:
+            return "[]"
+        if all(is_scalar(item) for item in value):
+            tokens = [json.dumps(item, ensure_ascii=False) for item in value]
+            if len(inline(value)) + len(pad) <= 110:
+                return "[" + ", ".join(tokens) + "]"
+            rows = []
+            row = []
+            row_len = 0
+            for token in tokens:
+                extra = len(token) + (2 if row else 0)
+                if row and len(child_pad) + row_len + extra > 110:
+                    rows.append(child_pad + ", ".join(row))
+                    row = []
+                    row_len = 0
+                    extra = len(token)
+                row.append(token)
+                row_len += extra
+            if row:
+                rows.append(child_pad + ", ".join(row))
+            return "[\n" + ",\n".join(rows) + "\n" + pad + "]"
+        if all(
+            isinstance(item, list) and all(is_scalar(child) for child in item)
+            for item in value
+        ):
+            if len(inline(value)) + len(pad) <= 110:
+                return inline(value)
+        rows = [child_pad + render(item, depth + 1) for item in value]
+        return "[\n" + ",\n".join(rows) + "\n" + pad + "]"
+
+    return render(value, 0)
+
+
+def _hexify_model_addresses(model):
+    for key in ("image_base", "min_ea", "max_ea"):
+        model["meta"][key] = _hex_address(model["meta"][key])
+    for segment in model["segments"]:
+        for key in ("start", "end"):
+            segment[key] = _hex_address(segment[key])
+    for function in model["functions"]:
+        for key in ("start", "end", "thunk_target"):
+            if key in function:
+                function[key] = _hex_address(function[key])
+    for name in model["names"]:
+        name["addr"] = _hex_address(name["addr"])
+    for relocation in model["relocations"]:
+        for key in ("addr", "target"):
+            relocation[key] = _hex_address(relocation[key])
+    for table in model["jump_tables"]:
+        for key in ("owner", "dispatch", "dispatch_addr", "start"):
+            table[key] = _hex_address(table[key])
+        for entry in table["entries"]:
+            for key in ("addr", "target"):
+                entry[key] = _hex_address(entry[key])
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +701,7 @@ def build_model():
     ptr_size = 8 if bits == 64 else 4
     jump_tables = export_jump_tables(ptr_size)
     relocations = build_relocations(ptr_size)
-    return {
+    return _hexify_model_addresses({
         "delink_ida_version": SCHEMA_VERSION,
         "meta": {
             "arch": _arch(procname, bits),
@@ -619,7 +719,7 @@ def build_model():
         "jump_tables": jump_tables,
         "names": export_names(relocations),
         "relocations": relocations,
-    }
+    })
 
 
 def _default_object_name():
@@ -648,7 +748,7 @@ def build_config(obj_name):
             continue
         if func.flags & ida_funcs.FUNC_TAIL:
             continue
-        addrs.append(int(func.start_ea))
+        addrs.append(_hex_address(func.start_ea))
     return {
         obj_name: {
             "functions": addrs,
@@ -684,8 +784,7 @@ def main():
     if not skip_model:
         model = build_model()
         with open(model_out, "w", encoding="utf-8") as fh:
-            # Pretty-printed so the export is human-readable and editable.
-            json.dump(model, fh, indent=2)
+            fh.write(_compact_json_dumps(model) + "\n")
         wrote.append(
             "model %d functions/%d names/%d relocs/%d segments -> %s"
             % (
@@ -700,7 +799,7 @@ def main():
     if config_out:
         cfg = build_config(obj_name or _default_object_name())
         with open(config_out, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2)
+            fh.write(_compact_json_dumps(cfg) + "\n")
         nfunc = sum(len(v["functions"]) for v in cfg.values())
         wrote.append("config %d functions -> %s" % (nfunc, config_out))
 
