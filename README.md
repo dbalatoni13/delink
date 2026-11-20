@@ -100,7 +100,7 @@ has to link against IDA:
    As with the Mach-O splitter, the first run writes an editable `idapro.json`
    grouping into the output directory. Each object can contain explicit
    functions, whole-function ranges, and half-open IDA virtual-address ranges
-   from `.rdata`, `.data`, and logical `.bss`:
+   from `.rdata`, `.data`, logical `.bss`, and custom sections.
 
    ```json
    {
@@ -109,7 +109,11 @@ has to link against IDA:
        "function_ranges": [[268442000, 268443000]],
        "rdata": [[268500992, 268501120]],
        "data": [[268566528, 268566592]],
-       "bss": [[268570624, 268571648]]
+       "bss": [[268570624, 268571648]],
+       "custom_sections": {
+         ".text$init": { "ranges": [[268443000, 268443120]] },
+         ".globals": { "kind": "data", "ranges": [[268566592, 268566608], [268566640, 268566656]] }
+       }
      }
    }
    ```
@@ -122,6 +126,15 @@ has to link against IDA:
    or to a BSS tail that IDA reports inside `.data`. The old
    `{ "<obj>": [<function-address>, ...] }` form is still accepted. Function
    and data-symbol metadata always comes from `delink.ida.json`.
+
+   Each `custom_sections` key is the output section name. Set its `kind` to
+   `code`, `data` (writable), `rdata` (read-only), or `bss` (zero-filled).
+   Names starting with `.text` default to `code` when `kind` is omitted.
+   Each half-open range must fit within a compatible IDA segment. `code`
+   ranges follow the same whole-function rules as `function_ranges`. Remove
+   any explicit `functions` entries for functions selected by such a range.
+   Delink combines the named section's ranges in ascending address order and
+   removes the assigned bytes from the shared object.
 
 ## Building
 

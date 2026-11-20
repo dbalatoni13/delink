@@ -760,11 +760,11 @@ def _default_object_name():
 def build_config(obj_name):
     """Collapsed grouping config: every function start address → `obj_name`.
 
-    The empty range lists make the editable whole-function, `.rdata`, `.data`,
-    and logical `.bss` range syntax visible in the generated config. Ranges are
-    half-open `[start, end)` pairs; function ranges must contain complete
-    functions. A `.bss` range may select a BSS segment or a zero-initialized
-    tail that IDA reports inside DATA.
+    The generated config includes fields for whole-function, `.rdata`, `.data`,
+    logical `.bss`, and custom section ranges. Each range is a half-open
+    `[start, end)` pair. Code ranges must contain complete functions. A `.bss`
+    range may select a BSS segment or a zero-initialized tail that IDA reports
+    inside DATA.
     """
     addrs = []
     for ea in idautils.Functions():
@@ -781,6 +781,7 @@ def build_config(obj_name):
             "rdata": [],
             "data": [],
             "bss": [],
+            "custom_sections": {},
         }
     }
 

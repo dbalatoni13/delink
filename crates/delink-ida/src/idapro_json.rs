@@ -1,8 +1,8 @@
 //! User-editable object grouping for the IDA workflow.
 //!
 //! Each output object lists its function start addresses and may also own
-//! half-open virtual-address ranges of whole functions, `.rdata`, `.data`, and
-//! logical `.bss`:
+//! half-open virtual-address ranges of whole functions, `.rdata`, `.data`,
+//! logical `.bss`, and custom output sections.
 //!
 //! ```json
 //! {
@@ -11,11 +11,16 @@
 //!     "function_ranges": [["0x2000", "0x23E8"]],
 //!     "rdata": [["0x11000", "0x11080"]],
 //!     "data": [["0x21000", "0x21040"]],
-//!     "bss": [["0x22000", "0x22400"]]
+//!     "bss": [["0x22000", "0x22400"]],
+//!     "custom_sections": {
+//!       ".text$init": { "ranges": [["0x3000", "0x3100"]] },
+//!       ".globals": { "kind": "data", "ranges": [["0x21040", "0x21080"], ["0x21100", "0x21120"]] }
+//!     }
 //!   }
 //! }
 //! ```
 //!
+//! Custom section names starting with `.text` default to `code`.
 //! The old `{ "file.obj": [address, ...] }` form remains accepted.
 
 use std::collections::BTreeMap;
@@ -114,6 +119,36 @@ impl DataRange {
     }
 }
 
+/// The output section type and the rules used to emit its ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomSectionKind {
+    Code,
+    Rdata,
+    Data,
+    Bss,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomSection {
+    pub kind: CustomSectionKind,
+    pub ranges: Vec<DataRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct CustomSectionInput {
+    #[serde(default, deserialize_with = "deserialize_explicit_kind")]
+    kind: Option<CustomSectionKind>,
+    ranges: Vec<DataRange>,
+}
+
+fn deserialize_explicit_kind<'de, D>(deserializer: D) -> Result<Option<CustomSectionKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CustomSectionKind::deserialize(deserializer).map(Some)
+}
+
 /// Contents assigned to one output object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ObjectGroup {
@@ -131,6 +166,9 @@ pub struct ObjectGroup {
     /// IDA BSS segment or a zero-initialized tail that IDA reports as DATA.
     #[serde(default)]
     pub bss: Vec<DataRange>,
+    /// Custom output section names and the ranges assigned to each one.
+    #[serde(default)]
+    pub custom_sections: BTreeMap<String, CustomSection>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -145,6 +183,8 @@ struct DetailedObjectGroup {
     data: Vec<DataRange>,
     #[serde(default)]
     bss: Vec<DataRange>,
+    #[serde(default)]
+    custom_sections: BTreeMap<String, CustomSectionInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -160,13 +200,35 @@ impl<'de> Deserialize<'de> for ObjectGroup {
         D: serde::Deserializer<'de>,
     {
         Ok(match ObjectGroupInput::deserialize(deserializer)? {
-            ObjectGroupInput::Detailed(group) => Self {
-                functions: group.functions,
-                function_ranges: group.function_ranges,
-                rdata: group.rdata,
-                data: group.data,
-                bss: group.bss,
-            },
+            ObjectGroupInput::Detailed(group) => {
+                let mut custom_sections = BTreeMap::new();
+                for (name, section) in group.custom_sections {
+                    let kind = match section.kind {
+                        Some(kind) => kind,
+                        None if name.starts_with(".text") => CustomSectionKind::Code,
+                        None => {
+                            return Err(D::Error::custom(format!(
+                                "custom section {name:?} requires a kind"
+                            )))
+                        }
+                    };
+                    custom_sections.insert(
+                        name,
+                        CustomSection {
+                            kind,
+                            ranges: section.ranges,
+                        },
+                    );
+                }
+                Self {
+                    functions: group.functions,
+                    function_ranges: group.function_ranges,
+                    rdata: group.rdata,
+                    data: group.data,
+                    bss: group.bss,
+                    custom_sections,
+                }
+            }
             ObjectGroupInput::Functions(functions) => Self {
                 functions: functions.into_iter().map(|address| address.0).collect(),
                 ..Self::default()
@@ -175,8 +237,7 @@ impl<'de> Deserialize<'de> for ObjectGroup {
     }
 }
 
-/// Output filename to its explicit/ranged functions and initialized-data
-/// ranges.
+/// Output filename to its functions and section ranges.
 pub type IdaproJson = BTreeMap<String, ObjectGroup>;
 
 /// Build a default grouping: one function per output file (extension `ext`,
@@ -224,6 +285,7 @@ mod tests {
         assert!(json["one.obj"].rdata.is_empty());
         assert!(json["one.obj"].bss.is_empty());
         assert!(json["one.obj"].function_ranges.is_empty());
+        assert!(json["one.obj"].custom_sections.is_empty());
     }
 
     #[test]
@@ -249,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn custom_sections_without_a_text_prefix_require_a_kind() {
+        let input = r#"{"one.obj":{"custom_sections":{".extra":{"ranges":[[4096,4100]]}}}}"#;
+        assert!(serde_json::from_str::<IdaproJson>(input).is_err());
+    }
+
+    #[test]
+    fn explicit_kind_overrides_the_text_default() {
+        let input = r#"{"one.obj":{"custom_sections":{".text.extra":{"kind":"data","ranges":[[4096,4100]]}}}}"#;
+        let json: IdaproJson = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            json["one.obj"].custom_sections[".text.extra"].kind,
+            CustomSectionKind::Data
+        );
+    }
+
+    #[test]
     fn serializes_the_editable_data_fields() {
         let json = IdaproJson::from([(
             "one.obj".to_string(),
@@ -263,6 +341,7 @@ mod tests {
         assert_eq!(value["one.obj"]["rdata"], serde_json::json!([]));
         assert_eq!(value["one.obj"]["data"], serde_json::json!([]));
         assert_eq!(value["one.obj"]["bss"], serde_json::json!([]));
+        assert_eq!(value["one.obj"]["custom_sections"], serde_json::json!({}));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use object::{
 };
 use rayon::prelude::*;
 
-use crate::idapro_json::{IdaproJson, ObjectGroup};
+use crate::idapro_json::{CustomSectionKind, IdaproJson, ObjectGroup};
 use crate::resolver::{IdaSymbols, SYM_BSS_START, SYM_CONST_START, SYM_DATA_START};
 use crate::{Function, IdaArch, IdaModel, JumpTable, PeImage, SegClass};
 
@@ -357,10 +357,8 @@ pub fn split_by_groups(
         .iter()
         .filter(|(_, group)| {
             !group.functions.is_empty()
-                || !group.function_ranges.is_empty()
-                || !group.rdata.is_empty()
-                || !group.data.is_empty()
-                || !group.bss.is_empty()
+                || code_ranges(group).next().is_some()
+                || data_ranges(group).next().is_some()
         })
         .collect();
     let outcomes = group_vec
@@ -432,7 +430,7 @@ pub fn emit_shared_for_groups(
         .collect();
     let owned_code_ranges: Vec<Range<u64>> = groups
         .values()
-        .flat_map(|group| group.function_ranges.iter().map(|range| range.range()))
+        .flat_map(|group| code_ranges(group).map(|(_, range)| range))
         .collect();
     emit_shared_excluding(
         model,
@@ -762,14 +760,6 @@ fn emit_object(
         funcs.push(*f);
     }
     funcs.sort_by_key(|f| f.start);
-    if funcs.is_empty()
-        && group.function_ranges.is_empty()
-        && group.rdata.is_empty()
-        && group.data.is_empty()
-        && group.bss.is_empty()
-    {
-        return Err(anyhow!("group has no code or data ranges"));
-    }
 
     let (arch, endian) = obj_arch(model);
     let mut obj = Object::new(format.binary_format(), arch, endian);
@@ -818,15 +808,32 @@ fn emit_object(
         });
         occupied.push(f.start..end);
     }
-    for configured in &group.function_ranges {
-        code_gaps.extend(subtract_ranges(configured.range(), &occupied));
+    let mut configured_code: Vec<_> = code_ranges(group).collect();
+    configured_code.sort_by_key(|(_, range)| range.start);
+    for (name, range) in &configured_code {
+        let name = name.unwrap_or(text_name);
+        code_gaps.extend(
+            subtract_ranges(range.clone(), &occupied)
+                .into_iter()
+                .map(|gap| (name, gap)),
+        );
     }
-    code_gaps.sort_by_key(|gap| gap.start);
-    let text_sid = obj.add_section(Vec::new(), text_name.as_bytes().to_vec(), SectionKind::Text);
+    let mut code_sections = HashMap::new();
+    let mut code_section = |obj: &mut Object<'_>, name: &str| {
+        if let Some(&sid) = code_sections.get(name) {
+            return sid;
+        }
+        let sid = obj.add_section(Vec::new(), name.as_bytes().to_vec(), SectionKind::Text);
+        code_sections.insert(name.to_owned(), sid);
+        sid
+    };
+    if group.custom_sections.is_empty() {
+        code_section(&mut obj, text_name);
+    }
 
-    // Append code-range gaps into the shared .text section in address order.
-    // Their symbols and relocations need the section offset returned here.
+    // Append gaps to their configured code section in address order.
     let emit_gap = |gap: Range<u64>,
+                    sid: SectionId,
                     obj: &mut Object<'_>,
                     pending: &mut Vec<Pending>,
                     local: &mut HashMap<String, SymbolId>,
@@ -854,10 +861,10 @@ fn emit_object(
             bytes[offset..offset + width].fill(0);
             gap_relocs.push((offset as u64, name, addend, flags));
         }
-        let gap_off = obj.append_section_data(text_sid, &bytes, 1);
+        let gap_off = obj.append_section_data(sid, &bytes, 1);
         for (offset, name, addend, flags) in gap_relocs {
             pending.push(Pending {
-                sid: text_sid,
+                sid,
                 offset: gap_off + offset,
                 sym: name,
                 addend,
@@ -872,12 +879,12 @@ fn emit_object(
                 }
                 let id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&label.name),
-                    value: gap_off + label.addr - gap.start,
+                    value: gap_off + (label.addr - gap.start),
                     size: label.size,
                     kind: SymbolKind::Data,
                     scope: SymbolScope::Dynamic,
                     weak: false,
-                    section: SymbolSection::Section(text_sid),
+                    section: SymbolSection::Section(sid),
                     flags: SymbolFlags::None,
                 });
                 local.entry(label.name.clone()).or_insert(id);
@@ -890,10 +897,12 @@ fn emit_object(
     for f in &funcs {
         while code_gaps
             .get(next_gap)
-            .is_some_and(|gap| gap.start < f.start)
+            .is_some_and(|(_, gap)| gap.start < f.start)
         {
+            let (section, gap) = &code_gaps[next_gap];
             emit_gap(
-                code_gaps[next_gap].clone(),
+                gap.clone(),
+                code_section(&mut obj, section),
                 &mut obj,
                 &mut pending,
                 &mut local,
@@ -904,7 +913,12 @@ fn emit_object(
         let name = &f.name;
         let start = f.start;
         let end = f.end;
-        let sid = text_sid;
+        let index = configured_code.partition_point(|(_, range)| range.start <= start);
+        let custom_name = index.checked_sub(1).and_then(|index| {
+            let (name, range) = &configured_code[index];
+            name.filter(|_| range.contains(&start))
+        });
+        let sid = code_section(&mut obj, custom_name.unwrap_or(text_name));
         let owner_section = model.section_for(start);
         let mut tables: Vec<JumpTable> = model
             .jump_tables
@@ -913,7 +927,10 @@ fn emit_object(
                 model.arch == IdaArch::X86
                     && table.owner == start
                     && owner_section.is_some_and(|owner| {
-                        owner.class == SegClass::Code
+                        (owner.class == SegClass::Code
+                            || (custom_name.is_some()
+                                && owner.class == SegClass::Other
+                                && owner.exec))
                             && model.section_for(table.start).is_some_and(|section| {
                                 section.start == owner.start && section.end == owner.end
                             })
@@ -1218,98 +1235,115 @@ fn emit_object(
     }
 
     // Append any trailing unnamed bytes after the final function.
-    while let Some(gap) = code_gaps.get(next_gap) {
-        emit_gap(gap.clone(), &mut obj, &mut pending, &mut local, &mut stats)?;
-        next_gap += 1;
+    for (section, gap) in code_gaps.into_iter().skip(next_gap) {
+        emit_gap(
+            gap,
+            code_section(&mut obj, section),
+            &mut obj,
+            &mut pending,
+            &mut local,
+            &mut stats,
+        )?;
     }
 
-    // Emit the configured initialized-data contributions into this object.
-    for (class, configured) in [
-        (SegClass::Const, group.rdata.as_slice()),
-        (SegClass::Data, group.data.as_slice()),
-        (SegClass::Bss, group.bss.as_slice()),
-    ] {
-        for configured_range in configured {
-            let mut range = configured_range.range();
-            let _section = model
-                .sections
-                .iter()
-                .find(|section| {
-                    (if class == SegClass::Bss {
-                        matches!(section.class, SegClass::Bss | SegClass::Data)
-                    } else if class == SegClass::Const {
-                        matches!(section.class, SegClass::Const | SegClass::Xtrn)
-                    } else {
-                        section.class == class
-                    }) && section.start <= range.start
-                        && range.end <= section.end
-                })
-                .expect("data ranges were validated before emission");
-            range.end = original_virtual_end(pe, model, range.start, range.end);
-            if range.start >= range.end {
-                continue;
+    // Keep the configured order for built-in sections and compact the ranges
+    // of each custom section in ascending address order.
+    let mut configured_data: Vec<_> = data_ranges(group).collect();
+    configured_data.sort_by_key(|(name, _, range)| name.map(|name| (name, range.start)));
+    let mut data_sections = HashMap::new();
+    for (custom_name, class, mut range) in configured_data {
+        range.end = original_virtual_end(pe, model, range.start, range.end);
+        if range.start >= range.end {
+            continue;
+        }
+        let (kind, section_name) = match class {
+            SegClass::Const => (SectionKind::ReadOnlyData, const_name(format)),
+            SegClass::Data => (SectionKind::Data, data_name(format)),
+            SegClass::Bss => (SectionKind::UninitializedData, bss_name(format)),
+            _ => unreachable!("only data classes are emitted here"),
+        };
+        let kind = if custom_name.is_none()
+            && class == SegClass::Data
+            && original_initialized_end(pe, model, range.start)
+                .is_some_and(|end| range.start >= end)
+        {
+            SectionKind::UninitializedData
+        } else {
+            kind
+        };
+        let data_sid = if let Some(name) = custom_name {
+            *data_sections
+                .entry(name)
+                .or_insert_with(|| obj.add_section(Vec::new(), name.as_bytes().to_vec(), kind))
+        } else {
+            let name = if kind == SectionKind::UninitializedData {
+                bss_name(format)
+            } else {
+                section_name
+            };
+            obj.add_section(Vec::new(), name.as_bytes().to_vec(), kind)
+        };
+        let size = range.end - range.start;
+        let base = if kind == SectionKind::UninitializedData {
+            // A logical BSS range is always zero-filled, even when IDA
+            // presents its virtual address range as part of `.data`.
+            obj.append_section_bss(data_sid, size, 1)
+        } else {
+            let rva = range.start.wrapping_sub(model.image_base);
+            let mut bytes = read_padded(pe, rva, size as usize);
+            let base = obj.section(data_sid).data().len() as u64;
+
+            for reloc in symbols.relocs_in(range.clone()) {
+                let Some(flags) = abs_flags(format, model.arch, reloc.size) else {
+                    continue;
+                };
+                let offset = (reloc.addr - range.start) as usize;
+                let width = reloc.size as usize;
+                if offset + width > bytes.len() {
+                    return Err(anyhow!(
+                        "data split boundary intersects the relocation at {:#x}",
+                        reloc.addr
+                    ));
+                }
+                if let Some((name, addend)) =
+                    resolve_split_data(symbols, owned_ranges, reloc.target)
+                {
+                    bytes[offset..offset + width].fill(0);
+                    pending.push(Pending {
+                        sid: data_sid,
+                        offset: base + offset as u64,
+                        sym: name,
+                        addend,
+                        flags,
+                    });
+                }
             }
-            let (kind, section_name) = match class {
-                SegClass::Const => (SectionKind::ReadOnlyData, const_name(format)),
-                SegClass::Data => (SectionKind::Data, data_name(format)),
-                SegClass::Bss => (SectionKind::UninitializedData, bss_name(format)),
+            obj.append_section_data(data_sid, &bytes, 1)
+        };
+
+        let anchor = data_anchor(class, range.start);
+        let anchor_id = obj.add_symbol(Symbol {
+            name: anchor.as_bytes().to_vec(),
+            value: base,
+            size: 0,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Section(data_sid),
+            flags: SymbolFlags::None,
+        });
+        local.insert(anchor, anchor_id);
+
+        if is_first_class_address(model, class, range.start) {
+            let name = match class {
+                SegClass::Const => SYM_CONST_START,
+                SegClass::Data => SYM_DATA_START,
+                SegClass::Bss => SYM_BSS_START,
                 _ => unreachable!("only data classes are emitted here"),
             };
-            let kind = if class == SegClass::Data
-                && original_initialized_end(pe, model, range.start)
-                    .is_some_and(|end| range.start >= end)
-            {
-                SectionKind::UninitializedData
-            } else {
-                kind
-            };
-            let section_name = if kind == SectionKind::UninitializedData {
-                bss_name(format).to_string()
-            } else {
-                section_name.to_string()
-            };
-            let data_sid = obj.add_section(Vec::new(), section_name.into_bytes(), kind);
-            let size = range.end - range.start;
-            if kind == SectionKind::UninitializedData {
-                // A logical BSS range is always zero-filled, even when IDA
-                // presents its virtual address range as part of `.data`.
-                obj.section_mut(data_sid).append_bss(size, 1);
-            } else {
-                let rva = range.start.wrapping_sub(model.image_base);
-                let mut bytes = read_padded(pe, rva, size as usize);
-
-                for reloc in symbols.relocs_in(range.clone()) {
-                    let Some(flags) = abs_flags(format, model.arch, reloc.size) else {
-                        continue;
-                    };
-                    let offset = (reloc.addr - range.start) as usize;
-                    let width = reloc.size as usize;
-                    if offset + width > bytes.len() {
-                        return Err(anyhow!(
-                            "data split boundary intersects the relocation at {:#x}",
-                            reloc.addr
-                        ));
-                    }
-                    if let Some((name, addend)) =
-                        resolve_split_data(symbols, owned_ranges, reloc.target)
-                    {
-                        bytes[offset..offset + width].fill(0);
-                        pending.push(Pending {
-                            sid: data_sid,
-                            offset: offset as u64,
-                            sym: name,
-                            addend,
-                            flags,
-                        });
-                    }
-                }
-                obj.append_section_data(data_sid, &bytes, 1);
-            }
-
-            let anchor = data_anchor(class, range.start);
-            let anchor_id = obj.add_symbol(Symbol {
-                name: anchor.as_bytes().to_vec(),
-                value: 0,
+            let id = obj.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: base,
                 size: 0,
                 kind: SymbolKind::Data,
                 scope: SymbolScope::Dynamic,
@@ -1317,48 +1351,39 @@ fn emit_object(
                 section: SymbolSection::Section(data_sid),
                 flags: SymbolFlags::None,
             });
-            local.insert(anchor, anchor_id);
+            local.insert(name.to_string(), id);
+        }
 
-            if is_first_class_address(model, class, range.start) {
-                let name = match class {
-                    SegClass::Const => SYM_CONST_START,
-                    SegClass::Data => SYM_DATA_START,
-                    SegClass::Bss => SYM_BSS_START,
-                    _ => unreachable!("only data classes are emitted here"),
-                };
-                let id = obj.add_symbol(Symbol {
-                    name: name.as_bytes().to_vec(),
-                    value: 0,
-                    size: 0,
-                    kind: SymbolKind::Data,
-                    scope: SymbolScope::Dynamic,
-                    weak: false,
-                    section: SymbolSection::Section(data_sid),
-                    flags: SymbolFlags::None,
-                });
-                local.insert(name.to_string(), id);
-            }
+        let variables = symbols
+            .variables
+            .range(range.clone())
+            .filter(|_| custom_name.is_none())
+            .map(|(&va, var)| (va, var.name.as_str(), var.size));
+        let custom_variables = code_names
+            .range(range.clone())
+            .filter(|_| custom_name.is_some())
+            .flat_map(|(_, names)| names)
+            .filter(|name| !name.is_func && !functions_by_start.contains_key(&name.addr))
+            .map(|name| (name.addr, name.name.as_str(), name.size));
+        for (va, name, size) in variables.chain(custom_variables) {
+            let id = obj.add_symbol(Symbol {
+                name: sanitize_symbol_name(name),
+                value: base + (va - range.start),
+                size,
+                kind: SymbolKind::Data,
+                scope: SymbolScope::Dynamic,
+                weak: false,
+                section: SymbolSection::Section(data_sid),
+                flags: SymbolFlags::None,
+            });
+            local.entry(name.to_owned()).or_insert(id);
+        }
 
-            for (va, variable) in symbols.variables.range(range.clone()) {
-                let id = obj.add_symbol(Symbol {
-                    name: sanitize_symbol_name(&variable.name),
-                    value: va - range.start,
-                    size: variable.size,
-                    kind: SymbolKind::Data,
-                    scope: SymbolScope::Dynamic,
-                    weak: false,
-                    section: SymbolSection::Section(data_sid),
-                    flags: SymbolFlags::None,
-                });
-                local.entry(variable.name.clone()).or_insert(id);
-            }
-
-            match class {
-                SegClass::Const => stats.const_bytes += size,
-                SegClass::Data => stats.data_bytes += size,
-                SegClass::Bss => stats.bss_bytes += size,
-                _ => unreachable!("only data classes are emitted here"),
-            }
+        match class {
+            SegClass::Const => stats.const_bytes += size,
+            SegClass::Data => stats.data_bytes += size,
+            SegClass::Bss => stats.bss_bytes += size,
+            _ => unreachable!("only data classes are emitted here"),
         }
     }
 
@@ -1662,23 +1687,63 @@ fn data_anchor(class: SegClass, start: u64) -> String {
     format!("__delink_ida_{section}_{start:016x}")
 }
 
+fn code_ranges(group: &ObjectGroup) -> impl Iterator<Item = (Option<&str>, Range<u64>)> + '_ {
+    group
+        .function_ranges
+        .iter()
+        .map(|range| (None, range.range()))
+        .chain(
+            group
+                .custom_sections
+                .iter()
+                .filter(|(_, section)| section.kind == CustomSectionKind::Code)
+                .flat_map(|(name, section)| {
+                    section
+                        .ranges
+                        .iter()
+                        .map(move |range| (Some(name.as_str()), range.range()))
+                }),
+        )
+}
+
+fn data_ranges(
+    group: &ObjectGroup,
+) -> impl Iterator<Item = (Option<&str>, SegClass, Range<u64>)> + '_ {
+    [
+        (SegClass::Const, group.rdata.as_slice()),
+        (SegClass::Data, group.data.as_slice()),
+        (SegClass::Bss, group.bss.as_slice()),
+    ]
+    .into_iter()
+    .flat_map(|(class, ranges)| ranges.iter().map(move |range| (None, class, range.range())))
+    .chain(
+        group
+            .custom_sections
+            .iter()
+            .filter_map(|(name, section)| {
+                let class = match section.kind {
+                    CustomSectionKind::Code => return None,
+                    CustomSectionKind::Rdata => SegClass::Const,
+                    CustomSectionKind::Data => SegClass::Data,
+                    CustomSectionKind::Bss => SegClass::Bss,
+                };
+                Some((name.as_str(), class, &section.ranges))
+            })
+            .flat_map(|(name, class, ranges)| {
+                ranges
+                    .iter()
+                    .map(move |range| (Some(name), class, range.range()))
+            }),
+    )
+}
+
 fn owned_data_ranges(groups: &IdaproJson) -> Vec<OwnedDataRange> {
     groups
         .values()
-        .flat_map(|group| {
-            group
-                .rdata
-                .iter()
-                .map(|range| (SegClass::Const, *range))
-                .chain(group.data.iter().map(|range| (SegClass::Data, *range)))
-                .chain(group.bss.iter().map(|range| (SegClass::Bss, *range)))
-        })
-        .map(|(class, configured)| {
-            let range = configured.range();
-            OwnedDataRange {
-                anchor: data_anchor(class, range.start),
-                range,
-            }
+        .flat_map(data_ranges)
+        .map(|(_, class, range)| OwnedDataRange {
+            anchor: data_anchor(class, range.start),
+            range,
         })
         .collect()
 }
@@ -1701,47 +1766,55 @@ fn resolve_split_data(
 }
 
 fn validate_data_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<()> {
-    let mut all: Vec<(u64, u64, &str, &'static str)> = Vec::new();
-    for (file, group) in groups.iter() {
-        for (field, class, ranges) in [
-            ("rdata", SegClass::Const, group.rdata.as_slice()),
-            ("data", SegClass::Data, group.data.as_slice()),
-            ("bss", SegClass::Bss, group.bss.as_slice()),
-        ] {
-            for configured in ranges {
-                let range = configured.range();
-                if range.start >= range.end {
-                    return Err(anyhow!(
-                        "idapro {file:?} {field} range [{:#x}, {:#x}) is empty or reversed",
-                        range.start,
-                        range.end
-                    ));
-                }
-                let contained = model.sections.iter().any(|section| {
-                    (if class == SegClass::Bss {
-                        // IDA may merge the zero-initialized tail into its
-                        // writable DATA segment. `bss` is therefore a logical
-                        // output classification, not a requirement that the
-                        // source segment already be named/classified BSS.
-                        matches!(section.class, SegClass::Bss | SegClass::Data)
-                    } else if class == SegClass::Const {
-                        // IDA may label the import table at the start of the
-                        // PE read-only section as XTRN.
-                        matches!(section.class, SegClass::Const | SegClass::Xtrn)
-                    } else {
-                        section.class == class
-                    }) && section.start <= range.start
-                        && range.end <= section.end
-                });
-                if !contained {
-                    return Err(anyhow!(
+    let mut all: Vec<(u64, u64, &str, &str)> = Vec::new();
+    for (file, group) in groups {
+        for name in group.custom_sections.keys() {
+            if name.is_empty() || name.contains('\0') || name == ".note.split" {
+                return Err(anyhow!(
+                    "idapro {file:?} invalid custom section name {name:?}"
+                ));
+            }
+        }
+        for (custom_name, class, range) in data_ranges(group) {
+            let field = custom_name.unwrap_or(match class {
+                SegClass::Const => "rdata",
+                SegClass::Data => "data",
+                SegClass::Bss => "bss",
+                _ => unreachable!("only data classes are validated here"),
+            });
+            if range.start >= range.end {
+                return Err(anyhow!(
+                    "idapro {file:?} {field} range [{:#x}, {:#x}) is empty or reversed",
+                    range.start,
+                    range.end
+                ));
+            }
+            let contained = model.sections.iter().any(|section| {
+                let compatible = if custom_name.is_some() && section.class == SegClass::Other {
+                    !section.exec
+                } else if class == SegClass::Bss {
+                    // IDA may merge the zero-initialized tail into its
+                    // writable DATA segment. `bss` is therefore a logical
+                    // output classification, not a requirement that the
+                    // source segment already be named/classified BSS.
+                    matches!(section.class, SegClass::Bss | SegClass::Data)
+                } else if class == SegClass::Const {
+                    // IDA may label the import table at the start of the
+                    // PE read-only section as XTRN.
+                    matches!(section.class, SegClass::Const | SegClass::Xtrn)
+                } else {
+                    section.class == class
+                };
+                compatible && section.start <= range.start && range.end <= section.end
+            });
+            if !contained {
+                return Err(anyhow!(
                         "idapro {file:?} {field} range [{:#x}, {:#x}) is not contained in a compatible section",
                         range.start,
                         range.end
                     ));
-                }
-                all.push((range.start, range.end, file, field));
             }
+            all.push((range.start, range.end, file, field));
         }
     }
     all.sort_by_key(|range| range.0);
@@ -1777,7 +1850,7 @@ fn expand_function_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<Idapr
     // error timing.
     if !groups
         .values()
-        .any(|group| !group.function_ranges.is_empty())
+        .any(|group| code_ranges(group).next().is_some())
     {
         return Ok(groups.clone());
     }
@@ -1787,22 +1860,23 @@ fn expand_function_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<Idapr
 
     let mut all_ranges: Vec<(u64, u64, &str)> = Vec::new();
     for (file, group) in groups {
-        for configured in &group.function_ranges {
-            let range = configured.range();
+        for (custom_name, range) in code_ranges(group) {
+            let field = custom_name.unwrap_or("function");
             if range.start >= range.end {
                 return Err(anyhow!(
-                    "idapro {file:?} function range [{:#x}, {:#x}) is empty or reversed",
+                    "idapro {file:?} {field} range [{:#x}, {:#x}) is empty or reversed",
                     range.start,
                     range.end
                 ));
             }
             if !model.sections.iter().any(|section| {
-                section.class == SegClass::Code
+                (section.class == SegClass::Code
+                    || (custom_name.is_some() && section.class == SegClass::Other && section.exec))
                     && section.start <= range.start
                     && range.end <= section.end
             }) {
                 return Err(anyhow!(
-                    "idapro {file:?} function range [{:#x}, {:#x}) is not contained in a code section",
+                    "idapro {file:?} {field} range [{:#x}, {:#x}) is not contained in a code section",
                     range.start,
                     range.end
                 ));
@@ -1851,14 +1925,14 @@ fn expand_function_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<Idapr
             }
         }
 
-        for configured in &group.function_ranges {
-            let range = configured.range();
+        for (custom_name, range) in code_ranges(group) {
+            let field = custom_name.unwrap_or("function");
             let first = functions.partition_point(|f| f.start < range.start);
             if first > 0 {
                 let preceding = functions[first - 1];
                 if preceding.end > range.start {
                     return Err(anyhow!(
-                        "idapro {file:?} function range [{:#x}, {:#x}) cuts through function '{}' [{:#x}, {:#x})",
+                        "idapro {file:?} {field} range [{:#x}, {:#x}) cuts through function '{}' [{:#x}, {:#x})",
                         range.start,
                         range.end,
                         preceding.name,
@@ -1873,7 +1947,7 @@ fn expand_function_ranges(model: &IdaModel, groups: &IdaproJson) -> Result<Idapr
                 }
                 if function.start < range.start || function.end > range.end {
                     return Err(anyhow!(
-                        "idapro {file:?} function range [{:#x}, {:#x}) cuts through function '{}' [{:#x}, {:#x})",
+                        "idapro {file:?} {field} range [{:#x}, {:#x}) cuts through function '{}' [{:#x}, {:#x})",
                         range.start,
                         range.end,
                         function.name,
@@ -2783,11 +2857,9 @@ mod tests {
         groups.insert(
             "owner.obj".to_string(),
             ObjectGroup {
-                functions: vec![],
-                function_ranges: vec![],
                 rdata: vec![DataRange([0x1104, 0x1108])],
                 data: vec![DataRange([0x1208, 0x1210])],
-                bss: vec![],
+                ..Default::default()
             },
         );
 
@@ -2829,6 +2901,123 @@ mod tests {
             (0x20..0x28).chain(0x30..0x40).collect::<Vec<_>>()
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_ranges_use_named_sections_and_compacted_relocation_offsets() {
+        let (mut model, mut pe, _) = test_model();
+        model.sections.push(crate::Section {
+            name: ".text".into(),
+            start: 0x1300,
+            end: 0x1310,
+            read: true,
+            write: false,
+            exec: true,
+            class: SegClass::Code,
+        });
+        pe.sections.push(PeSection {
+            name: ".text".into(),
+            rva: 0x300,
+            va: 0x1300,
+            virtual_size: 0x10,
+            data: vec![
+                0xe8, 7, 0, 0, 0, 0xc3, 0xcc, 0x90, 0x90, 0x90, 0x90, 0x90, 0xc3, 0xcc, 0x90, 0x90,
+            ],
+            characteristics: 0,
+        });
+        for (name, start, end) in [("caller", 0x1300, 0x1306), ("callee", 0x130c, 0x130d)] {
+            model.functions.push(Function {
+                name: name.into(),
+                start,
+                end,
+                thunk: false,
+                lib: false,
+                is_static: false,
+                public: false,
+            });
+        }
+        model.names.push(crate::Name {
+            addr: 0x1210,
+            size: 8,
+            name: "pointer".into(),
+            public: false,
+            weak: false,
+            is_func: false,
+        });
+        let symbols = IdaSymbols::build(
+            &model,
+            &[crate::Reloc {
+                addr: 0x1210,
+                target: 0x1205,
+                size: 8,
+                kind: "absolute".into(),
+            }],
+        );
+        let groups = serde_json::from_str(r#"{
+            "owner.obj": {"custom_sections": {
+                ".text$custom": {"ranges": [["0x130C", "0x130E"], ["0x1300", "0x1307"]]},
+                ".custom_data": {"kind": "data", "ranges": [["0x1210", "0x1218"], ["0x1204", "0x1208"]]},
+                ".custom_ro": {"kind": "rdata", "ranges": [["0x1100", "0x1104"]]},
+                ".custom_bss": {"kind": "bss", "ranges": [["0x1218", "0x121C"]]}
+            }}
+        }"#).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("delink-ida-custom-sections-{}", std::process::id()));
+        for format in [OutputFormat::Coff, OutputFormat::Elf] {
+            let outcomes = split_by_groups(&model, &pe, &symbols, &groups, &dir, format).unwrap();
+            assert_eq!(outcomes.len(), 1);
+            outcomes[0].result.as_ref().unwrap();
+            let bytes = std::fs::read(dir.join("owner.obj")).unwrap();
+            let file = object::File::parse(bytes.as_slice()).unwrap();
+            let code = file.section_by_name(".text$custom").unwrap();
+            assert_eq!(code.kind(), SectionKind::Text);
+            assert_eq!(&code.data().unwrap()[5..], &[0xc3, 0xcc, 0xc3, 0xcc]);
+            assert_eq!(file.symbol_by_name("callee").unwrap().address(), 7);
+            let (offset, relocation) = code.relocations().next().unwrap();
+            assert_eq!(offset, 1);
+            assert_eq!(
+                relocation.target(),
+                object::RelocationTarget::Symbol(file.symbol_by_name("callee").unwrap().index())
+            );
+
+            let data = file.section_by_name(".custom_data").unwrap();
+            assert_eq!(data.kind(), SectionKind::Data);
+            assert_eq!(data.size(), 12);
+            assert_eq!(&data.data().unwrap()[..4], &[0x24, 0x25, 0x26, 0x27]);
+            assert_eq!(file.symbol_by_name("pointer").unwrap().address(), 4);
+            let (offset, relocation) = data.relocations().next().unwrap();
+            assert_eq!(offset, 4);
+            let anchor = file
+                .symbol_by_name(&data_anchor(SegClass::Data, 0x1204))
+                .unwrap();
+            assert_eq!(
+                relocation.target(),
+                object::RelocationTarget::Symbol(anchor.index())
+            );
+            assert_eq!(
+                file.section_by_name(".custom_ro").unwrap().kind(),
+                SectionKind::ReadOnlyData
+            );
+            assert_eq!(
+                file.section_by_name(".custom_bss").unwrap().kind(),
+                SectionKind::UninitializedData
+            );
+
+            let shared = dir.join("shared.obj");
+            let stats =
+                emit_shared_for_groups(&model, &pe, &symbols, &groups, &shared, format).unwrap();
+            assert_eq!(stats.text_bytes, 7);
+            assert_eq!(stats.data_bytes, 16);
+            assert_eq!(section_data(&shared, ".text"), [0x90; 7]);
+            assert_eq!(
+                section_data(&shared, ".data"),
+                (0x20..0x24)
+                    .chain(0x28..0x30)
+                    .chain(0x3c..0x40)
+                    .collect::<Vec<_>>()
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
