@@ -537,7 +537,7 @@ fn emit_shared_excluding(
                 let base = obj.section(sid).data().len() as u64;
                 for reloc in symbols.relocs_in(gap.clone()) {
                     let Some((name, addend)) =
-                        resolve_split_data(symbols, owned_ranges, reloc.target)
+                        resolve_split_relocation(symbols, owned_ranges, reloc)
                     else {
                         continue;
                     };
@@ -650,8 +650,7 @@ fn emit_shared_excluding(
                             r.addr
                         ));
                     }
-                    if let Some((name, addend)) =
-                        resolve_split_data(symbols, owned_ranges, r.target)
+                    if let Some((name, addend)) = resolve_split_relocation(symbols, owned_ranges, r)
                     {
                         bytes[off..off + w].fill(0);
                         pending.push(PendingData {
@@ -849,7 +848,7 @@ fn emit_object(
             let Some(flags) = abs_flags(format, model.arch, reloc.size) else {
                 continue;
             };
-            let Some((name, addend)) = resolve_split_data(symbols, owned_ranges, reloc.target)
+            let Some((name, addend)) = resolve_split_relocation(symbols, owned_ranges, reloc)
             else {
                 continue;
             };
@@ -1053,7 +1052,7 @@ fn emit_object(
             if off + w > bytes.len() {
                 continue;
             }
-            if let Some((tname, addend)) = resolve_split_data(symbols, owned_ranges, r.target) {
+            if let Some((tname, addend)) = resolve_split_relocation(symbols, owned_ranges, r) {
                 bytes[off..off + w].fill(0);
                 abs.push((off as u64, tname, addend, flags));
             }
@@ -1305,8 +1304,7 @@ fn emit_object(
                         reloc.addr
                     ));
                 }
-                if let Some((name, addend)) =
-                    resolve_split_data(symbols, owned_ranges, reloc.target)
+                if let Some((name, addend)) = resolve_split_relocation(symbols, owned_ranges, reloc)
                 {
                     bytes[offset..offset + width].fill(0);
                     pending.push(Pending {
@@ -1746,6 +1744,21 @@ fn owned_data_ranges(groups: &IdaproJson) -> Vec<OwnedDataRange> {
             range,
         })
         .collect()
+}
+
+/// An explicit base selects the symbol even when the target lies outside it.
+fn resolve_split_relocation(
+    symbols: &IdaSymbols,
+    owned_ranges: &[OwnedDataRange],
+    reloc: &crate::Reloc,
+) -> Option<(String, i64)> {
+    if let Some(base) = reloc.symbol_base {
+        let (name, _) = symbols.resolve_exact(base)?;
+        let addend = i64::try_from(i128::from(reloc.target) - i128::from(base)).ok()?;
+        Some((name, addend))
+    } else {
+        resolve_split_data(symbols, owned_ranges, reloc.target)
+    }
 }
 
 fn resolve_split_data(
@@ -2950,6 +2963,7 @@ mod tests {
             &[crate::Reloc {
                 addr: 0x1210,
                 target: 0x1205,
+                symbol_base: None,
                 size: 8,
                 kind: "absolute".into(),
             }],
@@ -3178,6 +3192,141 @@ mod tests {
         )]);
         let error = expand_function_ranges(&model, &groups).unwrap_err();
         assert!(error.to_string().contains("cuts through function"));
+    }
+
+    #[test]
+    fn explicit_symbol_base_preserves_signed_addends_in_objects() {
+        let (mut model, mut pe, _) = test_model();
+        model.names.push(crate::Name {
+            addr: 0x1208,
+            size: 4,
+            name: "chosen_base".into(),
+            public: false,
+            weak: false,
+            is_func: false,
+        });
+        let dir =
+            std::env::temp_dir().join(format!("delink-ida-symbol-base-{}", std::process::id()));
+        for target in [0x1204u64, 0x121c] {
+            pe.sections[0].data[..8].copy_from_slice(&target.to_le_bytes());
+            model.relocations = vec![crate::Reloc {
+                addr: 0x1100,
+                target,
+                symbol_base: Some(0x1208),
+                size: 8,
+                kind: "absolute".into(),
+            }];
+            let combined = crate::combined_relocations(&model, &pe);
+            assert_eq!(combined.len(), 1);
+            assert_eq!(combined[0].symbol_base, Some(0x1208));
+            let symbols = IdaSymbols::build(&model, &combined);
+            let groups =
+                serde_json::from_str(r#"{"owner.obj":{"rdata":[["0x1100","0x1110"]]}}"#).unwrap();
+            for format in [OutputFormat::Coff, OutputFormat::Elf] {
+                let outcomes =
+                    split_by_groups(&model, &pe, &symbols, &groups, &dir, format).unwrap();
+                outcomes[0].result.as_ref().unwrap();
+                let bytes = std::fs::read(dir.join("owner.obj")).unwrap();
+                let file = object::File::parse(bytes.as_slice()).unwrap();
+                let section = file
+                    .section_by_name(".rdata")
+                    .or_else(|| file.section_by_name(".rodata"))
+                    .unwrap();
+                let (offset, relocation) = section.relocations().next().unwrap();
+                assert_eq!(offset, 0);
+                assert_eq!(
+                    relocation.target(),
+                    object::RelocationTarget::Symbol(
+                        file.symbol_by_name("chosen_base").unwrap().index()
+                    )
+                );
+                let implicit = if relocation.has_implicit_addend() {
+                    i64::from_le_bytes(section.data().unwrap()[..8].try_into().unwrap())
+                } else {
+                    0
+                };
+                assert_eq!(relocation.addend() + implicit, target as i64 - 0x1208);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_zero_base_overrides_the_symbol_containing_the_target() {
+        let (mut model, mut pe, _) = test_model();
+        model.image_base = 0;
+        pe.image_base = 0;
+        model.sections[0].start = 0x200;
+        model.sections[0].end = 0x210;
+        model.sections[1].start = 0;
+        model.sections[1].end = 0x110;
+        pe.sections[0].rva = 0x200;
+        pe.sections[0].va = 0x200;
+        pe.sections[0].data[..8].copy_from_slice(&0x104u64.to_le_bytes());
+        pe.sections[1].rva = 0;
+        pe.sections[1].va = 0;
+        pe.sections[1].virtual_size = 0x110;
+        pe.sections[1].data.resize(0x110, 0);
+        for (name, addr, size) in [("object1", 0, 0x100), ("object2", 0x100, 0x10)] {
+            model.names.push(crate::Name {
+                addr,
+                size,
+                name: name.into(),
+                public: false,
+                weak: false,
+                is_func: false,
+            });
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "delink-ida-zero-symbol-base-{}",
+            std::process::id()
+        ));
+        let groups =
+            serde_json::from_str(r#"{"owner.obj":{"rdata":[["0x200","0x210"]]}}"#).unwrap();
+        for (symbol_base, expected_symbol, expected_addend) in
+            [(None, "object2", 4), (Some(0), "object1", 0x104)]
+        {
+            model.relocations = vec![crate::Reloc {
+                addr: 0x200,
+                target: 0x104,
+                symbol_base,
+                size: 8,
+                kind: "absolute".into(),
+            }];
+            let combined = crate::combined_relocations(&model, &pe);
+            assert_eq!(combined.len(), 1);
+            let symbols = IdaSymbols::build(&model, &combined);
+            assert_eq!(
+                resolve_split_relocation(&symbols, &[], &combined[0]),
+                Some((expected_symbol.into(), expected_addend))
+            );
+            for format in [OutputFormat::Coff, OutputFormat::Elf] {
+                let outcomes =
+                    split_by_groups(&model, &pe, &symbols, &groups, &dir, format).unwrap();
+                outcomes[0].result.as_ref().unwrap();
+                let bytes = std::fs::read(dir.join("owner.obj")).unwrap();
+                let file = object::File::parse(bytes.as_slice()).unwrap();
+                let section = file
+                    .section_by_name(".rdata")
+                    .or_else(|| file.section_by_name(".rodata"))
+                    .unwrap();
+                let (offset, relocation) = section.relocations().next().unwrap();
+                assert_eq!(offset, 0);
+                assert_eq!(
+                    relocation.target(),
+                    object::RelocationTarget::Symbol(
+                        file.symbol_by_name(expected_symbol).unwrap().index()
+                    )
+                );
+                let implicit = if relocation.has_implicit_addend() {
+                    i64::from_le_bytes(section.data().unwrap()[..8].try_into().unwrap())
+                } else {
+                    0
+                };
+                assert_eq!(relocation.addend() + implicit, expected_addend);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

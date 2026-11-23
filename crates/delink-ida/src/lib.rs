@@ -145,6 +145,8 @@ pub struct Reloc {
     pub size: u32,
     /// The address the relocation points at.
     pub target: u64,
+    /// Optional exact symbol address; the addend is `target - symbol_base`.
+    pub symbol_base: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +293,8 @@ struct RawReloc {
     size: u32,
     #[serde(deserialize_with = "deserialize_address")]
     target: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_address")]
+    symbol_base: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -495,13 +499,29 @@ pub fn load(path: &Path) -> Result<IdaModel> {
     let relocations = raw
         .relocations
         .into_iter()
-        .map(|r| Reloc {
-            addr: r.addr,
-            kind: r.kind,
-            size: r.size,
-            target: r.target,
+        .map(|r| {
+            if let Some(base) = r.symbol_base {
+                ensure!(
+                    names.iter().any(|n| n.addr == base)
+                        || functions.iter().any(|f| f.start == base),
+                    "relocation at {:#x}: symbol_base {base:#x} is not a named symbol or function start",
+                    r.addr
+                );
+                ensure!(
+                    i64::try_from(i128::from(r.target) - i128::from(base)).is_ok(),
+                    "relocation at {:#x}: symbol_base addend exceeds signed 64-bit range",
+                    r.addr
+                );
+            }
+            Ok(Reloc {
+                addr: r.addr,
+                kind: r.kind,
+                size: r.size,
+                target: r.target,
+                symbol_base: r.symbol_base,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let jump_tables = raw
         .jump_tables
@@ -619,6 +639,7 @@ pub fn combined_relocations(model: &IdaModel, pe: &PeImage) -> Vec<Reloc> {
                 kind: "RELOC".to_string(),
                 size,
                 target: target_ida,
+                symbol_base: None,
             },
         );
     }
@@ -678,6 +699,26 @@ mod size_tests {
         assert_eq!(parsed.hex, 0x401000);
         assert_eq!(parsed.numeric, 0x401010);
         assert_eq!(parsed.optional, Some(0x401020));
+    }
+
+    #[test]
+    fn relocation_symbol_base_is_optional_and_accepts_addresses() {
+        for (field, expected) in [
+            ("", None),
+            (r#", "symbol_base": null"#, None),
+            (r#", "symbol_base": "0x403000""#, Some(0x403000)),
+            (r#", "symbol_base": 4206592"#, Some(0x403000)),
+        ] {
+            let json = format!(
+                r#"{{"addr":"0x401002","type":"OFF32","size":4,"target":"0x402FFC"{field}}}"#
+            );
+            let reloc: RawReloc = serde_json::from_str(&json).unwrap();
+            assert_eq!(reloc.symbol_base, expected);
+        }
+        assert!(serde_json::from_str::<RawReloc>(
+            r#"{"addr":1,"type":"OFF32","size":4,"target":2,"symbol_base":"bad"}"#
+        )
+        .is_err());
     }
 
     #[test]

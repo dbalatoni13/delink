@@ -41,6 +41,22 @@ has to link against IDA:
    are rejected. Older exports with function `end` addresses and no data sizes
    remain readable.
 
+   Each relocation in the IDA export JSON can optionally set `symbol_base`
+   to the address of a named symbol or function start. The emitted relocation
+   binds to that symbol with addend `target - symbol_base`, allowing negative
+   offsets and targets outside the symbol's bounds caused by compiler
+   optimizations. For example:
+
+   ```json
+   { "addr": "0x401002", "type": "OFF32", "size": 4, "target": "0x402FFC", "symbol_base": "0x403000" }
+   ```
+
+   This refers to the symbol at `0x403000` with addend `-4`. Addresses accept
+   hexadecimal strings or integers. Omit `symbol_base` (or set it to `null`)
+   to retain automatic target resolution. This field belongs in the export's
+   `relocations` array; `idapro.json` controls object grouping.
+
+
    ```shell
    # headless (idat64.exe for a 64-bit database)
    "idat.exe" -A -S"crates\delink-ida\ida_export.py delink.ida.json" database.idb
